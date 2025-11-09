@@ -1,4 +1,3 @@
-# api_server.py
 import asyncio
 import os
 import typing as t
@@ -6,20 +5,21 @@ from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-from ebay_sold_itempages import run as run_scrape  # noqa: E402
+# Import the high-level entrypoint (run_with_retries aliased as main)
+from ebay_sold_itempages import main as run_scrape  # <-- IMPORTANT
 
 app = FastAPI(
     title="FastAPI Scraper",
     version="1.1.0",
-    description="Playwright-powered scraper (Vercel-deployable).",
+    description="Playwright-powered scraper (Railway/Playwright docker).",
 )
 
-# Add CORS middleware for production
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "https://www.certiauth.co.uk",           # Your custom domain
-        "https://certi-admin-dashboard.vercel.app",  # Your Vercel domain
+        "https://www.certiauth.co.uk",
+        "https://certi-admin-dashboard.vercel.app",
         "http://localhost:3000",
         "http://127.0.0.1:3000",
     ],
@@ -27,6 +27,7 @@ app.add_middleware(
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
+
 
 @app.get("/")
 def root():
@@ -37,54 +38,35 @@ def root():
             "smoke": "/smoke",
             "scrape": "/scrape?query=...&pages=1&per_page=30&headless=true",
         },
-        "environment": "production" if os.environ.get("VERCEL") else "development"
+        "environment": "production" if os.environ.get("VERCEL") else "development",
     }
 
 
 @app.get("/health")
 def health():
     return {
-        "status": "ok", 
-        "environment": "production" if os.environ.get("VERCEL") else "development"
+        "status": "ok",
+        "environment": "production" if os.environ.get("VERCEL") else "development",
     }
 
 
 @app.get("/smoke")
 async def smoke():
-    # quick browser sanity check w/ example.com
+    # Quick browser sanity check
     try:
-        data = await run_scrape("__SMOKE__", pages=1, per_page=1, headless=True, usd_rate=1.28, mobile=True, smoke=True)
+        data = await run_scrape(
+            "__SMOKE__",
+            pages=1,
+            per_page=1,
+            headless=True,
+            usd_rate=1.28,
+            mobile=False,
+            smoke=True,
+        )
         return {"ok": True, "title": data.get("title", "n/a")}
     except Exception as e:
-        return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
-
-
-async def _call_run_scrape(
-    query: str,
-    *,
-    pages: int,
-    per_page: int,
-    headless: bool,
-    usd_rate: float,
-    mobile: bool,
-) -> t.Any:
-    if asyncio.iscoroutinefunction(run_scrape):
-        return await run_scrape(
-            query, pages=pages, headless=headless, usd_rate=usd_rate, per_page=per_page, mobile=mobile
-        )
-
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(
-        None,
-        lambda: run_scrape(
-            query,
-            pages=pages,
-            headless=headless,
-            usd_rate=usd_rate,
-            per_page=per_page,
-            mobile=mobile,
-        ),
-    )
+        # Keep 200 and report failure in body so platforms don't think the service is dead
+        return {"ok": False, "error": str(e)}
 
 
 @app.get("/scrape")
@@ -96,14 +78,13 @@ async def scrape(
     usd_rate: float = Query(1.28, gt=0),
     proxy: t.Optional[str] = None,
     dummy: bool = False,
-    mobile: bool = False,  # Changed to False for better desktop scraping
+    mobile: bool = False,
 ):
-    # Add Vercel-specific optimizations
+    # Vercel-specific tweak kept for compatibility (no effect on Railway unless VERCEL is set)
     if os.environ.get("VERCEL"):
-        # Production optimizations for Vercel
-        per_page = min(per_page, 10)  # Reduce items in production to avoid timeouts
-        headless = True  # Force headless in production
-    
+        per_page = min(per_page, 10)
+        headless = True
+
     if dummy:
         return {
             "success": True,
@@ -119,9 +100,11 @@ async def scrape(
             },
         }
 
+    # Clamp inputs
     pages = max(1, min(pages, 50))
     per_page = max(1, min(per_page, 200))
 
+    # Proxy handling (if you use it)
     old_http = os.environ.get("PLAYWRIGHT_HTTP_PROXY")
     old_https = os.environ.get("PLAYWRIGHT_HTTPS_PROXY")
 
@@ -130,27 +113,42 @@ async def scrape(
             os.environ["PLAYWRIGHT_HTTP_PROXY"] = proxy
             os.environ["PLAYWRIGHT_HTTPS_PROXY"] = proxy
 
-        data = await _call_run_scrape(
+        # run_scrape is async (run_with_retries), so call directly
+        data = await run_scrape(
             query,
             pages=pages,
             per_page=per_page,
             headless=headless,
             usd_rate=usd_rate,
             mobile=mobile,
+            smoke=False,
         )
+
+        # If scraper returns nothing, expose as logical error (not HTTP 500)
         if data is None:
-            return JSONResponse(
-                status_code=500,
-                content={"success": False, "error": "run_scrape returned None"},
-            )
-        return JSONResponse(content=data)
+            return {
+                "success": False,
+                "error": "run_scrape returned None",
+            }
+
+        # IMPORTANT: do NOT wrap in a 500; just return whatever the scraper says
+        # data already contains success/error/count/items.
+        return data
 
     except Exception as exc:
-        return JSONResponse(
-            status_code=500,
-            content={"success": False, "error": str(exc)},
-        )
+        # Catch unexpected stuff; still respond 200 with error payload
+        import traceback
+
+        print("❌ /scrape unhandled error:", exc)
+        print(traceback.format_exc())
+
+        return {
+            "success": False,
+            "error": f"/scrape failed: {type(exc).__name__}: {exc}",
+        }
+
     finally:
+        # Restore proxy env vars
         if old_http is not None:
             os.environ["PLAYWRIGHT_HTTP_PROXY"] = old_http
         elif "PLAYWRIGHT_HTTP_PROXY" in os.environ:
