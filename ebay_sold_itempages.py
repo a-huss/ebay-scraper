@@ -3,6 +3,7 @@ import re
 import time
 import urllib.parse
 import random
+import traceback
 from dataclasses import dataclass, asdict
 from typing import List, Dict, Any, Optional, Tuple
 
@@ -36,9 +37,9 @@ CHROMIUM_ARGS = [
     "--max-old-space-size=512",
 ]
 
-# Free proxy rotation placeholder
+# Free proxy rotation placeholder (currently unused)
 FREE_PROXIES = [
-    None,  # First try without proxy
+    None,
 ]
 
 
@@ -60,12 +61,10 @@ def _parse_price_to_gbp(price_text: str) -> Optional[float]:
     if not price_text:
         return None
 
-    # GBP patterns
     gbp_patterns = [
         r"£\s*([0-9][0-9,]*(?:\.[0-9]{2})?)",
         r"GBP\s*([0-9][0-9,]*(?:\.[0-9]{2})?)",
     ]
-
     for pattern in gbp_patterns:
         m = re.search(pattern, price_text, re.IGNORECASE)
         if m:
@@ -74,13 +73,11 @@ def _parse_price_to_gbp(price_text: str) -> Optional[float]:
             except ValueError:
                 continue
 
-    # USD patterns (convert with approx rate)
     usd_patterns = [
         r"US\s*\$\s*([0-9][0-9,]*(?:\.[0-9]{2})?)",
         r"\$\s*([0-9][0-9,]*(?:\.[0-9]{2})?)",
         r"USD\s*([0-9][0-9,]*(?:\.[0-9]{2})?)",
     ]
-
     for pattern in usd_patterns:
         m = re.search(pattern, price_text, re.IGNORECASE)
         if m:
@@ -109,7 +106,7 @@ def _build_search_url(query: str, page: int, mobile: bool) -> str:
 
 
 async def _extract_item_price_debug(page) -> Tuple[Optional[float], Optional[str]]:
-    """Enhanced price extraction with debugging."""
+    """Enhanced price extraction with debug logging."""
     print("🔍 Debug: Looking for price on item page...")
 
     price_selectors = [
@@ -128,36 +125,36 @@ async def _extract_item_price_debug(page) -> Tuple[Optional[float], Optional[str
     ]
 
     price_gbp = None
-    price_text_found = None
+    sold_info = None
 
-    # Try structured selectors first
     for selector in price_selectors:
         try:
             locator = page.locator(selector)
             count = await locator.count()
-            if count > 0:
-                for i in range(min(count, 3)):
-                    try:
-                        text = await locator.nth(i).text_content()
-                        if text:
-                            cleaned = text.strip()
-                            if not cleaned:
-                                continue
-                            print(f"💰 Found price text with '{selector}': '{cleaned}'")
-                            parsed = _parse_price_to_gbp(cleaned)
-                            if parsed is not None:
-                                price_gbp = parsed
-                                price_text_found = cleaned
-                                print(f"✅ Parsed price: £{price_gbp}")
-                                break
-                    except Exception:
+            if count == 0:
+                continue
+            for i in range(min(count, 3)):
+                try:
+                    text = await locator.nth(i).text_content()
+                    if not text:
                         continue
-                if price_gbp is not None:
-                    break
+                    cleaned = text.strip()
+                    if not cleaned:
+                        continue
+                    print(f"💰 Found price text with '{selector}': '{cleaned}'")
+                    parsed = _parse_price_to_gbp(cleaned)
+                    if parsed is not None:
+                        price_gbp = parsed
+                        print(f"✅ Parsed price: £{price_gbp}")
+                        break
+                except Exception:
+                    continue
+            if price_gbp is not None:
+                break
         except Exception:
             continue
 
-    # Fallback: scan full HTML for price-like patterns
+    # Fallback to regex scan of page content
     if price_gbp is None:
         try:
             content = await page.content()
@@ -166,14 +163,11 @@ async def _extract_item_price_debug(page) -> Tuple[Optional[float], Optional[str
                 parsed = _parse_price_to_gbp(match)
                 if parsed is not None:
                     price_gbp = parsed
-                    price_text_found = match
                     print(f"🔍 Found price in content: {match} -> £{price_gbp}")
                     break
         except Exception:
             pass
 
-    # Sold info
-    sold_info = None
     sold_selectors = [
         "span.ux-textspans:has-text('Ended') + span.ux-textspans",
         "div.ux-labels-values__labels:has(span:has-text('Ended')) + div .ux-textspans",
@@ -183,14 +177,13 @@ async def _extract_item_price_debug(page) -> Tuple[Optional[float], Optional[str
         ".vi-bboxrev-pos",
         ".vi-notify-new-bg-dBtm",
     ]
-
     for selector in sold_selectors:
         try:
             locator = page.locator(selector)
             if await locator.count() > 0:
-                sold_text = await locator.first.text_content()
-                if sold_text:
-                    sold_info = sold_text.strip()
+                text = await locator.first.text_content()
+                if text:
+                    sold_info = text.strip()
                     print(f"📅 Found sold info: {sold_info}")
                     break
         except Exception:
@@ -205,7 +198,6 @@ async def _extract_additional_info(page) -> Tuple[Optional[str], Optional[str], 
     shipping = None
     image = None
 
-    # Condition
     condition_selectors = [
         '.x-item-condition-text .ux-textspans',
         '[data-testid="x-item-condition-text"] .ux-textspans',
@@ -225,7 +217,6 @@ async def _extract_additional_info(page) -> Tuple[Optional[str], Optional[str], 
         except Exception:
             pass
 
-    # Shipping
     shipping_selectors = [
         '#fshippingCost',
         '.ux-labels-values__values:has(.ux-textspans:has-text("Postage")) .ux-textspans',
@@ -245,7 +236,6 @@ async def _extract_additional_info(page) -> Tuple[Optional[str], Optional[str], 
         except Exception:
             pass
 
-    # Image
     image_selectors = [
         '#icImg',
         '#mainImg',
@@ -257,7 +247,7 @@ async def _extract_additional_info(page) -> Tuple[Optional[str], Optional[str], 
         try:
             locator = page.locator(selector)
             if await locator.count() > 0:
-                src = await locator.first.get_attribute('src')
+                src = await locator.first.get_attribute("src")
                 if src:
                     image = src
                     break
@@ -268,18 +258,26 @@ async def _extract_additional_info(page) -> Tuple[Optional[str], Optional[str], 
 
 
 async def _new_browser_context(pw, *, headless: bool, mobile: bool, proxy_index=0):
-    """Memory-optimized browser context for Railway."""
-    browser = await pw.chromium.launch(
-        headless=headless,
-        args=CHROMIUM_ARGS,
-    )
+    """Memory-optimized browser context for Railway, with safe error handling."""
+    try:
+        browser = await pw.chromium.launch(
+            headless=headless,
+            args=CHROMIUM_ARGS,
+        )
+    except PWError as e:
+        print("❌ PLAYWRIGHT_LAUNCH_ERROR:", e)
+        print(traceback.format_exc())
+        # Propagate to be turned into a clean JSON error by caller
+        raise
+    except Exception as e:
+        print("❌ UNKNOWN_LAUNCH_ERROR:", e)
+        print(traceback.format_exc())
+        raise
 
-    # Use a single user agent to save memory
     user_agent = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     )
-
     print(f"🕵️ Using User Agent: {user_agent[:50]}...")
 
     context = await browser.new_context(
@@ -289,7 +287,7 @@ async def _new_browser_context(pw, *, headless: bool, mobile: bool, proxy_index=
         timezone_id="Europe/London",
     )
 
-    # Correct: route handlers must accept (route, request)
+    # Correct handler signature: (route, request)
     async def block_resource(route, request):
         await route.abort()
 
@@ -316,12 +314,13 @@ async def run_with_retries(
     max_retries: int = 2,
 ) -> Dict[str, Any]:
     """
-    Enhanced run function with retry logic and minimal retries for Railway.
+    Retry wrapper that ALWAYS returns a dict (no unhandled exceptions).
     """
-    for attempt in range(max_retries):
-        try:
-            print(f"🔄 Attempt {attempt + 1}/{max_retries} for query: '{query}'")
+    last_error = None
 
+    for attempt in range(max_retries):
+        print(f"🔄 Attempt {attempt + 1}/{max_retries} for query='{query}'")
+        try:
             result = await run(
                 query,
                 pages=pages,
@@ -333,34 +332,31 @@ async def run_with_retries(
                 proxy_index=attempt,
             )
 
-            if result.get("success") and result.get("count", 0) > 0:
-                print(f"✅ Success on attempt {attempt + 1} - found {result['count']} items")
+            # run() already returns a structured error on failure
+            if result.get("success", False):
+                print(
+                    f"✅ Success on attempt {attempt + 1} "
+                    f"with {result.get('count', 0)} items"
+                )
                 return result
-            elif result.get("success") and result.get("count", 0) == 0:
-                print(f"⚠️ No items found on attempt {attempt + 1}, returning result")
-                return result
+
+            print(f"⚠️ Attempt {attempt + 1} returned error: {result.get('error')}")
+            last_error = result.get("error")
 
         except Exception as e:
-            print(f"❌ Attempt {attempt + 1} failed: {e}")
-            if attempt == max_retries - 1:
-                return {
-                    "success": False,
-                    "error": f"All {max_retries} attempts failed: {str(e)}",
-                    "query": query,
-                    "pages_requested": pages,
-                    "per_page_requested": per_page,
-                    "count": 0,
-                    "items": [],
-                    "elapsed_sec": 0,
-                }
+            last_error = str(e)
+            print(f"❌ Exception in attempt {attempt + 1}: {e}")
+            print(traceback.format_exc())
 
-            wait_time = 2 ** attempt
-            print(f"⏳ Waiting {wait_time}s before retry...")
-            await asyncio.sleep(wait_time)
+        if attempt < max_retries - 1:
+            wait = 2 ** attempt
+            print(f"⏳ Waiting {wait}s before retry...")
+            await asyncio.sleep(wait)
 
+    # If we get here, all attempts failed
     return {
         "success": False,
-        "error": f"All {max_retries} attempts failed",
+        "error": f"All {max_retries} attempts failed. Last error: {last_error}",
         "query": query,
         "pages_requested": pages,
         "per_page_requested": per_page,
@@ -383,200 +379,254 @@ async def run(
 ) -> Dict[str, Any]:
     """
     Memory-optimized scraper for Railway with individual page visits.
+    ALWAYS returns a dict; internal errors are caught & reported.
     """
     start_time = time.time()
     all_items: List[Dict[str, Any]] = []
     seen_urls = set()
 
-    async with async_playwright() as pw:
-        browser, context, page = await _new_browser_context(
-            pw,
-            headless=headless,
-            mobile=mobile,
-            proxy_index=proxy_index,
-        )
-
-        try:
-            if smoke:
-                await page.goto("https://example.com", wait_until="domcontentloaded")
-                title = await page.title()
-                return {"success": True, "title": title}
-
-            for page_num in range(1, pages + 1):
-                if len(all_items) >= per_page:
-                    break
-
-                search_url = _build_search_url(query, page_num, mobile=False)
-                print(f"🔍 Searching: {search_url}")
-
-                try:
-                    await asyncio.sleep(random.uniform(1, 3))
-                    await page.goto(
-                        search_url,
-                        wait_until="domcontentloaded",
-                        timeout=45000,
-                    )
-                    await page.wait_for_load_state("networkidle")
-                    print("✅ Search page loaded successfully")
-                except PWTimeout:
-                    print(f"❌ Timeout loading search page {page_num}")
-                    continue
-                except Exception as e:
-                    print(f"❌ Error loading search page {page_num}: {e}")
-                    continue
-
-                # Scroll to load content
-                for _ in range(3):
-                    await page.mouse.wheel(0, random.randint(800, 2000))
-                    await page.wait_for_timeout(random.randint(300, 800))
-
-                # Extract item info from search page
-                items = await page.evaluate(
-                    """
-                    (() => {
-                      const out = [];
-                      const seen = new Set();
-                      const nodes = Array.from(document.querySelectorAll('a[href*="/itm/"]'));
-                      for (const a of nodes) {
-                        const href = a.getAttribute('href') || '';
-                        if (!href || seen.has(href)) continue;
-
-                        let card = a.closest('li') ||
-                                   a.closest('[class*="s-item"]') ||
-                                   a.parentElement;
-
-                        const title =
-                          (card &&
-                            (card.querySelector('.s-item__title, h3.s-item__title, [role="heading"]')
-                              ?.textContent || '')
-                            .trim()) ||
-                          (a.textContent || '').trim();
-
-                        if (!title || title.toLowerCase().includes('shop on ebay')) continue;
-
-                        let image = null;
-                        const imgEl = card?.querySelector('img');
-                        if (imgEl) {
-                          image = imgEl.getAttribute('src') || imgEl.getAttribute('data-src');
-                        }
-
-                        let price_text = '';
-                        const priceEl = card?.querySelector('.s-item__price');
-                        if (priceEl) {
-                          price_text = priceEl.textContent.trim();
-                        }
-
-                        let shipping_text = '';
-                        const shippingEl = card?.querySelector('.s-item__shipping, .s-item__logisticsCost');
-                        if (shippingEl) {
-                          shipping_text = shippingEl.textContent.trim();
-                        }
-
-                        out.push({ title, url: href, image, price_text, shipping_text });
-                        seen.add(href);
-                      }
-                      return out;
-                    })()
-                    """
+    try:
+        async with async_playwright() as pw:
+            # Isolate browser launch errors and convert to JSON error
+            try:
+                browser, context, page = await _new_browser_context(
+                    pw,
+                    headless=headless,
+                    mobile=mobile,
+                    proxy_index=proxy_index,
                 )
+            except Exception as e:
+                return {
+                    "success": False,
+                    "error": f"Browser launch failed: {e}",
+                    "query": query,
+                    "pages_requested": pages,
+                    "per_page_requested": per_page,
+                    "count": 0,
+                    "items": [],
+                    "elapsed_sec": round(time.time() - start_time, 3),
+                }
 
-                print(f"📦 Found {len(items)} items on page {page_num}")
+            try:
+                if smoke:
+                    await page.goto("https://example.com", wait_until="domcontentloaded")
+                    title = await page.title()
+                    return {
+                        "success": True,
+                        "title": title,
+                        "elapsed_sec": round(time.time() - start_time, 3),
+                    }
 
-                # Process only first 10 items per page for memory & speed
-                items_to_process = items[:10]
-                processed_count = 0
-
-                for item in items_to_process:
-                    if len(all_items) >= per_page or processed_count >= 10:
+                for page_num in range(1, pages + 1):
+                    if len(all_items) >= per_page:
                         break
 
-                    item_url = item["url"]
-                    if item_url.startswith("//"):
-                        item_url = "https:" + item_url
-                    elif not item_url.startswith("http"):
-                        item_url = "https://www.ebay.co.uk" + item_url
-
-                    clean_url = re.sub(r"\?.*$", "", item_url)
-                    if clean_url in seen_urls:
-                        continue
-                    seen_urls.add(clean_url)
-
-                    print(f"🛒 Visiting ({processed_count + 1}/10): {item['title'][:60]}...")
+                    search_url = _build_search_url(query, page_num, mobile=False)
+                    print(f"🔍 Searching: {search_url}")
 
                     try:
-                        await asyncio.sleep(2)
-
+                        await asyncio.sleep(random.uniform(1, 3))
                         await page.goto(
-                            item_url,
+                            search_url,
                             wait_until="domcontentloaded",
-                            timeout=30000,
+                            timeout=45000,
                         )
                         await page.wait_for_load_state("networkidle")
-
-                        price_gbp, sold_info = await _extract_item_price_debug(page)
-                        condition, shipping, image = await _extract_additional_info(page)
-
-                        # Fallbacks from search results
-                        if not image and item.get("image"):
-                            image = item["image"]
-
-                        search_price_text = item.get("price_text", "") or ""
-                        search_shipping_text = item.get("shipping_text", "") or ""
-
-                        if price_gbp is None and search_price_text:
-                            parsed = _parse_price_to_gbp(search_price_text)
-                            if parsed is not None:
-                                price_gbp = parsed
-                                print(f"🔄 Using search result price: £{price_gbp}")
-
-                        if not shipping and search_shipping_text:
-                            shipping = search_shipping_text
-
-                        sold_item = SoldItem(
-                            title=item["title"]
-                            .replace("Opens in a new window or tab", "")
-                            .strip(),
-                            price_text=(
-                                f"£{price_gbp:.2f}"
-                                if price_gbp is not None
-                                else search_price_text or "N/A"
-                            ),
-                            price_gbp=price_gbp,
-                            price_usd=_gbp_to_usd(price_gbp, usd_rate),
-                            shipping_text=shipping,
-                            condition=condition,
-                            sold_info=sold_info,
-                            url=clean_url,
-                            image=image,
-                        )
-
-                        all_items.append(asdict(sold_item))
-                        processed_count += 1
-                        print(
-                            f"✅ Collected: {sold_item.title[:60]}... | "
-                            f"Price: {sold_item.price_text}"
-                        )
-
+                        print("✅ Search page loaded successfully")
+                    except PWTimeout:
+                        print(f"❌ Timeout loading search page {page_num}")
+                        continue
                     except Exception as e:
-                        print(f"❌ Failed to process {item['title'][:60]}: {e}")
+                        print(f"❌ Error loading search page {page_num}: {e}")
                         continue
 
-                print(f"📊 Page {page_num} complete. Total collected: {len(all_items)}")
+                    # Scroll a bit to load content
+                    for _ in range(3):
+                        await page.mouse.wheel(0, random.randint(800, 2000))
+                        await page.wait_for_timeout(random.randint(300, 800))
 
-        except Exception as e:
-            print(f"❌ Fatal error: {e}")
-            return {
-                "success": False,
-                "error": f"{type(e).__name__}: {e}",
-                "query": query,
-                "pages_requested": pages,
-                "per_page_requested": per_page,
-                "count": len(all_items),
-                "items": all_items,
-                "elapsed_sec": round(time.time() - start_time, 3),
-            }
-        finally:
-            await browser.close()
+                    # Get candidate items from search page
+                    items = await page.evaluate(
+                        """
+                        (() => {
+                          const out = [];
+                          const seen = new Set();
+                          const nodes = Array.from(
+                            document.querySelectorAll('a[href*="/itm/"]')
+                          );
+                          for (const a of nodes) {
+                            const href = a.getAttribute('href') || '';
+                            if (!href || seen.has(href)) continue;
+
+                            let card =
+                              a.closest('li') ||
+                              a.closest('[class*="s-item"]') ||
+                              a.parentElement;
+
+                            const title = (
+                              (card &&
+                                (card.querySelector(
+                                  '.s-item__title, h3.s-item__title, [role="heading"]'
+                                )?.textContent || '')
+                              ) ||
+                              (a.textContent || '')
+                            ).trim();
+
+                            if (!title || title.toLowerCase().includes('shop on ebay')) {
+                              continue;
+                            }
+
+                            let image = null;
+                            const imgEl = card?.querySelector('img');
+                            if (imgEl) {
+                              image =
+                                imgEl.getAttribute('src') ||
+                                imgEl.getAttribute('data-src');
+                            }
+
+                            let price_text = '';
+                            const priceEl = card?.querySelector('.s-item__price');
+                            if (priceEl) {
+                              price_text = priceEl.textContent.trim();
+                            }
+
+                            let shipping_text = '';
+                            const shippingEl = card?.querySelector(
+                              '.s-item__shipping, .s-item__logisticsCost'
+                            );
+                            if (shippingEl) {
+                              shipping_text = shippingEl.textContent.trim();
+                            }
+
+                            out.push({
+                              title,
+                              url: href,
+                              image,
+                              price_text,
+                              shipping_text,
+                            });
+                            seen.add(href);
+                          }
+                          return out;
+                        })()
+                        """
+                    )
+
+                    print(f"📦 Found {len(items)} items on page {page_num}")
+
+                    items_to_process = items[:10]
+                    processed_count = 0
+
+                    for item in items_to_process:
+                        if len(all_items) >= per_page or processed_count >= 10:
+                            break
+
+                        item_url = item["url"]
+                        if item_url.startswith("//"):
+                            item_url = "https:" + item_url
+                        elif not item_url.startswith("http"):
+                            item_url = "https://www.ebay.co.uk" + item_url
+
+                        clean_url = re.sub(r"\?.*$", "", item_url)
+                        if clean_url in seen_urls:
+                            continue
+                        seen_urls.add(clean_url)
+
+                        print(
+                            f"🛒 Visiting ({processed_count + 1}/10): "
+                            f"{item['title'][:60]}..."
+                        )
+
+                        try:
+                            await asyncio.sleep(2)
+                            await page.goto(
+                                item_url,
+                                wait_until="domcontentloaded",
+                                timeout=30000,
+                            )
+                            await page.wait_for_load_state("networkidle")
+
+                            price_gbp, sold_info = await _extract_item_price_debug(page)
+                            condition, shipping, image = await _extract_additional_info(
+                                page
+                            )
+
+                            if not image and item.get("image"):
+                                image = item["image"]
+
+                            search_price_text = item.get("price_text") or ""
+                            search_shipping_text = item.get("shipping_text") or ""
+
+                            if price_gbp is None and search_price_text:
+                                parsed = _parse_price_to_gbp(search_price_text)
+                                if parsed is not None:
+                                    price_gbp = parsed
+                                    print(
+                                        f"🔄 Using search result price: £{price_gbp}"
+                                    )
+
+                            if not shipping and search_shipping_text:
+                                shipping = search_shipping_text
+
+                            sold_item = SoldItem(
+                                title=item["title"]
+                                .replace(
+                                    "Opens in a new window or tab", ""
+                                )
+                                .strip(),
+                                price_text=(
+                                    f"£{price_gbp:.2f}"
+                                    if price_gbp is not None
+                                    else search_price_text or "N/A"
+                                ),
+                                price_gbp=price_gbp,
+                                price_usd=_gbp_to_usd(price_gbp, usd_rate),
+                                shipping_text=shipping,
+                                condition=condition,
+                                sold_info=sold_info,
+                                url=clean_url,
+                                image=image,
+                            )
+
+                            all_items.append(asdict(sold_item))
+                            processed_count += 1
+
+                            print(
+                                f"✅ Collected: {sold_item.title[:60]}... | "
+                                f"Price: {sold_item.price_text}"
+                            )
+
+                        except Exception as e:
+                            print(
+                                f"❌ Failed to process {item['title'][:60]}: {e}"
+                            )
+                            print(traceback.format_exc())
+                            continue
+
+                    print(
+                        f"📊 Page {page_num} complete. "
+                        f"Total collected so far: {len(all_items)}"
+                    )
+
+            finally:
+                try:
+                    await browser.close()
+                except Exception as e:
+                    print("⚠️ Error while closing browser:", e)
+
+    except Exception as e:
+        print("❌ Outer fatal error in run():", e)
+        print(traceback.format_exc())
+        return {
+            "success": False,
+            "error": f"Fatal error: {e}",
+            "query": query,
+            "pages_requested": pages,
+            "per_page_requested": per_page,
+            "count": len(all_items),
+            "items": all_items,
+            "elapsed_sec": round(time.time() - start_time, 3),
+        }
 
     return {
         "success": True,
@@ -589,5 +639,5 @@ async def run(
     }
 
 
-# Backward-compatible entry point
+# Entry point used by your FastAPI route
 main = run_with_retries
