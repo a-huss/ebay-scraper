@@ -1,0 +1,31 @@
+{
+  "version": 2,
+  "builds": [
+    {
+      "src": "api_server.py",
+      "use": "@vercel/python"
+    },
+    {
+      "src": "requirements.txt",
+      "use": "@vercel/static-build",
+      "config": {
+        "distDir": "."
+      }
+    }
+  ],
+  "routes": [
+    {
+      "src": "/(.*)",
+      "dest": "api_server.py"
+    }
+  ],
+  "functions": {
+    "api_server.py": {
+      "maxDuration": 300,
+      "memory": 3008
+    }
+  },
+  "env": {
+    "PLAYWRIGHT_BROWSERS_PATH": "0"
+  }
+}
