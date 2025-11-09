@@ -1,17 +1,14 @@
-import asyncio
 import os
 import typing as t
 from fastapi import FastAPI, Query
-from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-# Import the high-level entrypoint (run_with_retries aliased as main)
-from ebay_sold_itempages import main as run_scrape  # <-- IMPORTANT
+from ebay_sold_itempages import main as run_scrape  # uses run_with_retries
 
 app = FastAPI(
     title="FastAPI Scraper",
     version="1.1.0",
-    description="Playwright-powered scraper (Railway/Playwright docker).",
+    description="Playwright-powered scraper (Railway / Docker).",
 )
 
 # CORS
@@ -52,7 +49,10 @@ def health():
 
 @app.get("/smoke")
 async def smoke():
-    # Quick browser sanity check
+    """
+    Quick browser sanity check.
+    Uses run_scrape(..., smoke=True) which hits example.com.
+    """
     try:
         data = await run_scrape(
             "__SMOKE__",
@@ -65,7 +65,6 @@ async def smoke():
         )
         return {"ok": True, "title": data.get("title", "n/a")}
     except Exception as e:
-        # Keep 200 and report failure in body so platforms don't think the service is dead
         return {"ok": False, "error": str(e)}
 
 
@@ -80,7 +79,12 @@ async def scrape(
     dummy: bool = False,
     mobile: bool = False,
 ):
-    # Vercel-specific tweak kept for compatibility (no effect on Railway unless VERCEL is set)
+    """
+    Public scraping endpoint.
+    Always returns JSON with success flag; avoids raw 500s from scraper.
+    """
+
+    # Vercel-specific tweak (no effect on Railway unless VERCEL env is set)
     if os.environ.get("VERCEL"):
         per_page = min(per_page, 10)
         headless = True
@@ -100,11 +104,11 @@ async def scrape(
             },
         }
 
-    # Clamp inputs
+    # Clamp
     pages = max(1, min(pages, 50))
     per_page = max(1, min(per_page, 200))
 
-    # Proxy handling (if you use it)
+    # Optional proxy support
     old_http = os.environ.get("PLAYWRIGHT_HTTP_PROXY")
     old_https = os.environ.get("PLAYWRIGHT_HTTPS_PROXY")
 
@@ -113,7 +117,7 @@ async def scrape(
             os.environ["PLAYWRIGHT_HTTP_PROXY"] = proxy
             os.environ["PLAYWRIGHT_HTTPS_PROXY"] = proxy
 
-        # run_scrape is async (run_with_retries), so call directly
+        # run_scrape is async (run_with_retries)
         data = await run_scrape(
             query,
             pages=pages,
@@ -124,29 +128,24 @@ async def scrape(
             smoke=False,
         )
 
-        # If scraper returns nothing, expose as logical error (not HTTP 500)
         if data is None:
             return {
                 "success": False,
                 "error": "run_scrape returned None",
             }
 
-        # IMPORTANT: do NOT wrap in a 500; just return whatever the scraper says
-        # data already contains success/error/count/items.
+        # Do NOT convert this into HTTP 500; just return structured JSON
         return data
 
     except Exception as exc:
-        # Catch unexpected stuff; still respond 200 with error payload
         import traceback
 
         print("❌ /scrape unhandled error:", exc)
         print(traceback.format_exc())
-
         return {
             "success": False,
             "error": f"/scrape failed: {type(exc).__name__}: {exc}",
         }
-
     finally:
         # Restore proxy env vars
         if old_http is not None:

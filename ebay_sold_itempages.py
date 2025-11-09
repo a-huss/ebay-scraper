@@ -7,11 +7,11 @@ import traceback
 from dataclasses import dataclass, asdict
 from typing import List, Dict, Any, Optional, Tuple
 
-from playwright.async_api import async_playwright, TimeoutError as PWTimeout, Error as PWError
+from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
-# -----------------------------
-# Models
-# -----------------------------
+# =========================
+# Data Model
+# =========================
 
 @dataclass
 class SoldItem:
@@ -26,11 +26,12 @@ class SoldItem:
     image: Optional[str]
 
 
-# -----------------------------
+# =========================
 # Helpers
-# -----------------------------
+# =========================
 
 def _parse_price_to_gbp(price_text: str) -> Optional[float]:
+    """Parse price text to GBP float - handles both GBP and USD."""
     if not price_text:
         return None
 
@@ -78,11 +79,12 @@ def _build_search_url(query: str, page: int, mobile: bool) -> str:
     )
 
 
-# -----------------------------
+# =========================
 # Extraction helpers
-# -----------------------------
+# =========================
 
 async def _extract_item_price_debug(page) -> Tuple[Optional[float], Optional[str]]:
+    """Extract price (GBP) and sold info from an item page, with logging."""
     print("🔍 Debug: Looking for price on item page...")
 
     selectors = [
@@ -100,8 +102,9 @@ async def _extract_item_price_debug(page) -> Tuple[Optional[float], Optional[str
         '.notranslate',
     ]
 
-    price_gbp = None
+    price_gbp: Optional[float] = None
 
+    # Try targeted selectors
     for selector in selectors:
         try:
             locator = page.locator(selector)
@@ -131,6 +134,7 @@ async def _extract_item_price_debug(page) -> Tuple[Optional[float], Optional[str
         except Exception:
             continue
 
+    # Fallback: scan page HTML for price-looking patterns
     if price_gbp is None:
         try:
             content = await page.content()
@@ -143,7 +147,8 @@ async def _extract_item_price_debug(page) -> Tuple[Optional[float], Optional[str
         except Exception:
             pass
 
-    sold_info = None
+    # Sold info
+    sold_info: Optional[str] = None
     sold_selectors = [
         "span.ux-textspans:has-text('Ended') + span.ux-textspans",
         "div.ux-labels-values__labels:has(span:has-text('Ended')) + div .ux-textspans",
@@ -169,6 +174,7 @@ async def _extract_item_price_debug(page) -> Tuple[Optional[float], Optional[str
 
 
 async def _extract_additional_info(page) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """Extract condition, shipping and image from item page."""
     condition = None
     shipping = None
     image = None
@@ -229,14 +235,14 @@ async def _extract_additional_info(page) -> Tuple[Optional[str], Optional[str], 
     return condition, shipping, image
 
 
-# -----------------------------
+# =========================
 # Browser context
-# -----------------------------
+# =========================
 
 async def _new_browser_context(pw, *, headless: bool):
     """
-    Use Playwright's official docker image defaults.
-    No aggressive flags: those can crash chromium in constrained envs.
+    Use Playwright's defaults for the official docker image.
+    No extreme flags that can destabilize Chromium.
     """
     try:
         browser = await pw.chromium.launch(headless=headless)
@@ -259,10 +265,10 @@ async def _new_browser_context(pw, *, headless: bool):
         timezone_id="Europe/London",
     )
 
+    # Lightweight resource blocking
     async def block_resource(route, request):
         await route.abort()
 
-    # Keep it light, but not insane
     await context.route("**/*.{png,jpg,jpeg,gif,webp,svg}", block_resource)
     await context.route("**/*.css", block_resource)
     await context.route("**/*.woff2", block_resource)
@@ -273,9 +279,9 @@ async def _new_browser_context(pw, *, headless: bool):
     return browser, context
 
 
-# -----------------------------
-# Main run logic
-# -----------------------------
+# =========================
+# Core run + retries
+# =========================
 
 async def run_with_retries(
     query: str,
@@ -284,11 +290,14 @@ async def run_with_retries(
     per_page: int = 30,
     headless: bool = True,
     usd_rate: float = 1.28,
-    mobile: bool = False,  # kept for signature compatibility
+    mobile: bool = False,  # kept for compatibility, not heavily used
     smoke: bool = False,
     max_retries: int = 2,
 ) -> Dict[str, Any]:
-    last_error = None
+    """
+    Wrapper that retries run() a few times and always returns a structured dict.
+    """
+    last_error: Optional[str] = None
 
     for attempt in range(max_retries):
         print(f"🔄 Attempt {attempt + 1}/{max_retries} for query='{query}'")
@@ -299,14 +308,19 @@ async def run_with_retries(
                 per_page=per_page,
                 headless=headless,
                 usd_rate=usd_rate,
+                mobile=mobile,
                 smoke=smoke,
             )
 
             if result.get("success"):
+                print(
+                    f"✅ Success on attempt {attempt + 1} "
+                    f"with {result.get('count', 0)} items"
+                )
                 return result
 
             last_error = result.get("error") or "Unknown error"
-            print(f"⚠️ Scrape attempt {attempt + 1} failed: {last_error}")
+            print(f"⚠️ Attempt {attempt + 1} failed logically: {last_error}")
 
         except Exception as e:
             last_error = str(e)
@@ -337,8 +351,12 @@ async def run(
     per_page: int = 30,
     headless: bool = True,
     usd_rate: float = 1.28,
+    mobile: bool = False,  # not used currently
     smoke: bool = False,
 ) -> Dict[str, Any]:
+    """
+    Single-attempt scrape. Returns structured dict; does NOT raise on normal failures.
+    """
     start_time = time.time()
     all_items: List[Dict[str, Any]] = []
     seen_urls = set()
@@ -347,7 +365,7 @@ async def run(
         async with async_playwright() as pw:
             browser, context = await _new_browser_context(pw, headless=headless)
 
-            # Smoke test
+            # Smoke test path
             if smoke:
                 page = await context.new_page()
                 await page.goto("https://example.com", wait_until="domcontentloaded")
@@ -385,16 +403,14 @@ async def run(
                         print(f"❌ Error loading search page {page_num}: {e}")
                         continue
 
-                    # Scroll a bit to load lazy content
+                    # Scroll a bit to load more items
                     for _ in range(3):
-                        await search_page.mouse.wheel(
-                            0, random.randint(800, 1600)
-                        )
+                        await search_page.mouse.wheel(0, random.randint(800, 1600))
                         await search_page.wait_for_timeout(
                             random.randint(200, 600)
                         )
 
-                    # Grab candidate items
+                    # Collect candidate items from the search page
                     items = await search_page.evaluate(
                         """
                         (() => {
@@ -464,7 +480,7 @@ async def run(
 
                     print(f"📦 Found {len(items)} items on page {page_num}")
 
-                    # Process only first 10 items to stay light
+                    # Process only first 10 items to stay resource-light
                     for idx, item in enumerate(items[:10], start=1):
                         if len(all_items) >= per_page:
                             break
@@ -482,7 +498,6 @@ async def run(
 
                         print(f"🛒 Visiting ({idx}/10): {item['title'][:80]}")
 
-                        # Use a fresh page per item to avoid TargetClosedError cascade
                         item_page = await context.new_page()
                         try:
                             await asyncio.sleep(random.uniform(0.8, 1.6))
@@ -573,16 +588,20 @@ async def run(
             "elapsed_sec": round(time.time() - start_time, 3),
         }
 
+    # Decide success based on items
+    success = len(all_items) > 0
+
     return {
-        "success": True,
+        "success": success,
         "query": query,
         "pages_requested": pages,
         "per_page_requested": per_page,
         "count": len(all_items),
         "items": all_items,
         "elapsed_sec": round(time.time() - start_time, 3),
+        **({} if success else {"error": "No items collected"}),
     }
 
 
-# Backwards-compatible alias
+# Backwards-compatible entrypoint used by FastAPI
 main = run_with_retries
