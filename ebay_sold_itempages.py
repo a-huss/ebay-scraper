@@ -17,36 +17,28 @@ USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Edge/120.0.0.0 Safari/537.36"
 ]
 
-# Enhanced stealth arguments
+# Memory-optimized arguments for Railway
 CHROMIUM_ARGS = [
     "--no-sandbox",
     "--disable-dev-shm-usage",
     "--disable-blink-features=AutomationControlled",
-    "--disable-features=VizDisplayCompositor",
-    "--disable-background-timer-throttling",
-    "--disable-backgrounding-occluded-windows",
-    "--disable-renderer-backgrounding",
-    "--disable-web-security",
-    "--disable-features=TranslateUI",
-    "--disable-ipc-flooding-protection",
+    "--disable-gpu",  # Critical for Railway
+    "--single-process",  # Use single process to save memory
+    "--no-zygote",
     "--no-first-run",
-    "--no-default-browser-check",
-    "--disable-component-extensions-with-background-pages",
-    "--disable-default-apps",
     "--disable-extensions",
     "--disable-plugins",
     "--disable-translate",
-    "--disable-sync",
-    "--metrics-recording-only",
-    "--mute-audio",
-    "--no-zygote",
-    "--disable-gpu",
+    "--disable-background-timer-throttling",
+    "--disable-renderer-backgrounding",
+    "--disable-backgrounding-occluded-windows",
+    "--memory-pressure-off",
+    "--max-old-space-size=512",  # Limit memory
 ]
 
 # Free proxy rotation (will fall back to no proxy if these don't work)
 FREE_PROXIES = [
     None,  # First try without proxy
-    # You can add free proxies here if needed, but we'll start without
 ]
 
 @dataclass
@@ -276,42 +268,28 @@ async def _extract_additional_info(page) -> Tuple[Optional[str], Optional[str], 
 
 
 async def _new_browser_context(pw, *, headless: bool, mobile: bool, proxy_index=0):
-    """Enhanced browser context with stealth features"""
+    """Memory-optimized browser context for Railway"""
     browser = await pw.chromium.launch(
         headless=headless, 
         args=CHROMIUM_ARGS
     )
     
-    # Rotate proxies and user agents
-    proxy = FREE_PROXIES[proxy_index % len(FREE_PROXIES)]
-    user_agent = random.choice(USER_AGENTS)
+    # Use a single user agent to save memory
+    user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     
     print(f"🕵️ Using User Agent: {user_agent[:50]}...")
-    if proxy:
-        print(f"🔁 Using proxy: {proxy.get('server', 'unknown')}")
     
     context = await browser.new_context(
-        viewport={"width": 1366, "height": 768},
+        viewport={"width": 1280, "height": 720},  # Smaller viewport to save memory
         user_agent=user_agent,
         locale="en-GB",
         timezone_id="Europe/London",
-        proxy=proxy,
-        # Extra stealth headers
-        extra_http_headers={
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Accept-Language': 'en-GB,en;q=0.5',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'DNT': '1',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1',
-            'Sec-Fetch-Dest': 'document',
-            'Sec-Fetch-Mode': 'navigate',
-            'Sec-Fetch-Site': 'none',
-        }
     )
     
-    # Block images to speed up loading and reduce detection
+    # Block unnecessary resources to save memory
     await context.route("**/*.{png,jpg,jpeg,gif,webp,svg}", lambda route: route.abort())
+    await context.route("**/*.css", lambda route: route.abort())
+    await context.route("**/*.woff2", lambda route: route.abort())
     
     # Increase timeouts for better reliability
     context.set_default_navigation_timeout(60000)
@@ -329,7 +307,7 @@ async def run_with_retries(
     usd_rate: float = 1.28,
     mobile: bool = False,
     smoke: bool = False,
-    max_retries: int = 3
+    max_retries: int = 2  # Reduced retries to save memory
 ) -> Dict[str, Any]:
     """
     Enhanced run function with retry logic and proxy rotation
@@ -346,7 +324,7 @@ async def run_with_retries(
                 usd_rate=usd_rate,
                 mobile=mobile,
                 smoke=smoke,
-                proxy_index=attempt  # Rotate proxies for each retry
+                proxy_index=attempt
             )
             
             if result.get('success') and result.get('count', 0) > 0:
@@ -401,7 +379,7 @@ async def run(
     proxy_index: int = 0
 ) -> Dict[str, Any]:
     """
-    Scrape eBay UK 'Sold' results using the proven individual page approach
+    Memory-optimized scraper for Railway with individual page visits
     """
     start_time = time.time()
     all_items: List[Dict[str, Any]] = []
@@ -420,7 +398,7 @@ async def run(
                 if len(all_items) >= per_page:
                     break
                     
-                # Navigate to search results page with enhanced stealth
+                # Navigate to search results page
                 search_url = _build_search_url(query, page_num, mobile=False)
                 print(f"🔍 Searching: {search_url}")
                 
@@ -487,9 +465,13 @@ async def run(
 
                 print(f"📦 Found {len(items)} items on page {page_num}")
 
-                # Visit individual item pages
-                for item in items:
-                    if len(all_items) >= per_page:
+                # MEMORY OPTIMIZATION: Process only first 10 items per page to avoid crashes
+                items_to_process = items[:10]
+                
+                # Visit individual item pages with memory management
+                processed_count = 0
+                for item in items_to_process:
+                    if len(all_items) >= per_page or processed_count >= 10:
                         break
                         
                     # Normalize URL
@@ -505,11 +487,11 @@ async def run(
                         continue
                     seen_urls.add(clean_url)
 
-                    print(f"🛒 Visiting: {item['title'][:60]}...")
+                    print(f"🛒 Visiting ({processed_count + 1}/10): {item['title'][:60]}...")
                     
                     try:
-                        # Add random delay between item pages
-                        await asyncio.sleep(random.uniform(0.5, 2))
+                        # Add longer delay between item pages to reduce memory pressure
+                        await asyncio.sleep(2)
                         
                         # Navigate to item page
                         await page.goto(item_url, wait_until="domcontentloaded", timeout=30000)
@@ -550,6 +532,7 @@ async def run(
                         )
                         
                         all_items.append(asdict(sold_item))
+                        processed_count += 1
                         print(f"✅ Collected: {sold_item.title[:60]}... | Price: £{price_gbp}")
                         
                     except Exception as e:
