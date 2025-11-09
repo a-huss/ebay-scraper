@@ -2,19 +2,51 @@ import asyncio
 import re
 import time
 import urllib.parse
+import random
 from dataclasses import dataclass, asdict
 from typing import List, Dict, Any, Optional, Tuple
 
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout, Error as PWError
 
-# Use the same UA as your working scraper
-UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-      "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+# Enhanced stealth configuration
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/120.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Edge/120.0.0.0 Safari/537.36"
+]
 
+# Enhanced stealth arguments
 CHROMIUM_ARGS = [
     "--no-sandbox",
     "--disable-dev-shm-usage",
     "--disable-blink-features=AutomationControlled",
+    "--disable-features=VizDisplayCompositor",
+    "--disable-background-timer-throttling",
+    "--disable-backgrounding-occluded-windows",
+    "--disable-renderer-backgrounding",
+    "--disable-web-security",
+    "--disable-features=TranslateUI",
+    "--disable-ipc-flooding-protection",
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--disable-component-extensions-with-background-pages",
+    "--disable-default-apps",
+    "--disable-extensions",
+    "--disable-plugins",
+    "--disable-translate",
+    "--disable-sync",
+    "--metrics-recording-only",
+    "--mute-audio",
+    "--no-zygote",
+    "--disable-gpu",
+]
+
+# Free proxy rotation (will fall back to no proxy if these don't work)
+FREE_PROXIES = [
+    None,  # First try without proxy
+    # You can add free proxies here if needed, but we'll start without
 ]
 
 @dataclass
@@ -243,23 +275,118 @@ async def _extract_additional_info(page) -> Tuple[Optional[str], Optional[str], 
     return condition, shipping, image
 
 
-async def _new_browser_context(pw, *, headless: bool, mobile: bool):
+async def _new_browser_context(pw, *, headless: bool, mobile: bool, proxy_index=0):
+    """Enhanced browser context with stealth features"""
     browser = await pw.chromium.launch(
         headless=headless, 
         args=CHROMIUM_ARGS
     )
     
+    # Rotate proxies and user agents
+    proxy = FREE_PROXIES[proxy_index % len(FREE_PROXIES)]
+    user_agent = random.choice(USER_AGENTS)
+    
+    print(f"🕵️ Using User Agent: {user_agent[:50]}...")
+    if proxy:
+        print(f"🔁 Using proxy: {proxy.get('server', 'unknown')}")
+    
     context = await browser.new_context(
         viewport={"width": 1366, "height": 768},
-        user_agent=UA,
+        user_agent=user_agent,
         locale="en-GB",
         timezone_id="Europe/London",
+        proxy=proxy,
+        # Extra stealth headers
+        extra_http_headers={
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-GB,en;q=0.5',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'DNT': '1',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+        }
     )
     
-    context.set_default_navigation_timeout(45000)
-    context.set_default_timeout(30000)
+    # Block images to speed up loading and reduce detection
+    await context.route("**/*.{png,jpg,jpeg,gif,webp,svg}", lambda route: route.abort())
+    
+    # Increase timeouts for better reliability
+    context.set_default_navigation_timeout(60000)
+    context.set_default_timeout(45000)
     
     return browser, context, await context.new_page()
+
+
+async def run_with_retries(
+    query: str,
+    *,
+    pages: int = 1,
+    per_page: int = 30,
+    headless: bool = True,
+    usd_rate: float = 1.28,
+    mobile: bool = False,
+    smoke: bool = False,
+    max_retries: int = 3
+) -> Dict[str, Any]:
+    """
+    Enhanced run function with retry logic and proxy rotation
+    """
+    for attempt in range(max_retries):
+        try:
+            print(f"🔄 Attempt {attempt + 1}/{max_retries} for query: '{query}'")
+            
+            result = await run(
+                query, 
+                pages=pages, 
+                per_page=per_page,
+                headless=headless,
+                usd_rate=usd_rate,
+                mobile=mobile,
+                smoke=smoke,
+                proxy_index=attempt  # Rotate proxies for each retry
+            )
+            
+            if result.get('success') and result.get('count', 0) > 0:
+                print(f"✅ Success on attempt {attempt + 1} - found {result['count']} items")
+                return result
+            elif result.get('success') and result.get('count', 0) == 0:
+                print(f"⚠️ No items found on attempt {attempt + 1}, but request succeeded")
+                # Still return the result even if no items found
+                return result
+                
+        except Exception as e:
+            print(f"❌ Attempt {attempt + 1} failed: {e}")
+            if attempt == max_retries - 1:
+                # If all retries failed, return error
+                return {
+                    "success": False,
+                    "error": f"All {max_retries} attempts failed: {str(e)}",
+                    "query": query,
+                    "pages_requested": pages,
+                    "per_page_requested": per_page,
+                    "count": 0,
+                    "items": [],
+                    "elapsed_sec": 0,
+                }
+            
+            # Wait before retry with exponential backoff
+            wait_time = 2 ** attempt
+            print(f"⏳ Waiting {wait_time}s before retry...")
+            await asyncio.sleep(wait_time)
+    
+    return {
+        "success": False,
+        "error": f"All {max_retries} attempts failed",
+        "query": query,
+        "pages_requested": pages,
+        "per_page_requested": per_page,
+        "count": 0,
+        "items": [],
+        "elapsed_sec": 0,
+    }
 
 
 async def run(
@@ -271,6 +398,7 @@ async def run(
     usd_rate: float = 1.28,
     mobile: bool = False,
     smoke: bool = False,
+    proxy_index: int = 0
 ) -> Dict[str, Any]:
     """
     Scrape eBay UK 'Sold' results using the proven individual page approach
@@ -280,7 +408,7 @@ async def run(
     seen_urls = set()
 
     async with async_playwright() as pw:
-        browser, context, page = await _new_browser_context(pw, headless=headless, mobile=mobile)
+        browser, context, page = await _new_browser_context(pw, headless=headless, mobile=mobile, proxy_index=proxy_index)
 
         try:
             if smoke:
@@ -292,12 +420,15 @@ async def run(
                 if len(all_items) >= per_page:
                     break
                     
-                # Navigate to search results page
+                # Navigate to search results page with enhanced stealth
                 search_url = _build_search_url(query, page_num, mobile=False)
                 print(f"🔍 Searching: {search_url}")
                 
                 try:
-                    await page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
+                    # Add random delay before navigation to appear more human
+                    await asyncio.sleep(random.uniform(1, 3))
+                    
+                    await page.goto(search_url, wait_until="domcontentloaded", timeout=45000)
                     await page.wait_for_load_state("networkidle")
                     print("✅ Search page loaded successfully")
                 except PWTimeout:
@@ -307,10 +438,10 @@ async def run(
                     print(f"❌ Error loading search page {page_num}: {e}")
                     continue
 
-                # Scroll to load content
+                # Scroll to load content with random patterns
                 for _ in range(3):
-                    await page.mouse.wheel(0, 1500)
-                    await page.wait_for_timeout(500)
+                    await page.mouse.wheel(0, random.randint(800, 2000))
+                    await page.wait_for_timeout(random.randint(300, 800))
 
                 # Extract item links & titles from search results
                 items = await page.evaluate("""
@@ -377,8 +508,11 @@ async def run(
                     print(f"🛒 Visiting: {item['title'][:60]}...")
                     
                     try:
+                        # Add random delay between item pages
+                        await asyncio.sleep(random.uniform(0.5, 2))
+                        
                         # Navigate to item page
-                        await page.goto(item_url, wait_until="domcontentloaded", timeout=20000)
+                        await page.goto(item_url, wait_until="domcontentloaded", timeout=30000)
                         await page.wait_for_load_state("networkidle")
                         
                         # Extract detailed information
@@ -421,9 +555,6 @@ async def run(
                     except Exception as e:
                         print(f"❌ Failed to process {item['title'][:60]}: {e}")
                         continue
-                    
-                    # Polite delay between item pages
-                    await page.wait_for_timeout(1000)
 
                 print(f"📊 Page {page_num} complete. Total collected: {len(all_items)}")
 
@@ -451,3 +582,7 @@ async def run(
         "items": all_items,
         "elapsed_sec": round(time.time() - start_time, 3),
     }
+
+
+# For backward compatibility, alias the main function
+main = run_with_retries
