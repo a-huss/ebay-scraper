@@ -104,7 +104,7 @@ async def _extract_item_price_debug(page) -> Tuple[Optional[float], Optional[str
 
     price_gbp: Optional[float] = None
 
-    # Try targeted selectors
+    # Targeted selectors
     for selector in selectors:
         try:
             locator = page.locator(selector)
@@ -134,7 +134,7 @@ async def _extract_item_price_debug(page) -> Tuple[Optional[float], Optional[str
         except Exception:
             continue
 
-    # Fallback: scan page HTML for price-looking patterns
+    # Fallback: scan HTML for any price-looking patterns
     if price_gbp is None:
         try:
             content = await page.content()
@@ -236,16 +236,24 @@ async def _extract_additional_info(page) -> Tuple[Optional[str], Optional[str], 
 
 
 # =========================
-# Browser context
+# Browser context (merged, safe for Railway)
 # =========================
 
 async def _new_browser_context(pw, *, headless: bool):
     """
-    Use Playwright's defaults for the official docker image.
-    No extreme flags that can destabilize Chromium.
+    Stable browser context for constrained containers (Railway).
+    Uses minimal but essential flags; avoids dangerous ones.
     """
     try:
-        browser = await pw.chromium.launch(headless=headless)
+        browser = await pw.chromium.launch(
+            headless=headless,
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+            ],
+        )
     except Exception as e:
         print("❌ PLAYWRIGHT_LAUNCH_ERROR:", e)
         print(traceback.format_exc())
@@ -263,20 +271,45 @@ async def _new_browser_context(pw, *, headless: bool):
         user_agent=user_agent,
         locale="en-GB",
         timezone_id="Europe/London",
+        java_script_enabled=True,
+        ignore_https_errors=True,
     )
 
-    # Lightweight resource blocking
-    async def block_resource(route, request):
-        await route.abort()
+    # Block heavy assets; keep CSS for layout stability
+    async def block_assets(route, request):
+        if request.resource_type in ("image", "media", "font"):
+            await route.abort()
+        else:
+            await route.continue_()
 
-    await context.route("**/*.{png,jpg,jpeg,gif,webp,svg}", block_resource)
-    await context.route("**/*.css", block_resource)
-    await context.route("**/*.woff2", block_resource)
+    await context.route("**/*", block_assets)
 
-    context.set_default_navigation_timeout(60000)
-    context.set_default_timeout(45000)
+    context.set_default_navigation_timeout(45000)
+    context.set_default_timeout(30000)
 
     return browser, context
+
+
+# =========================
+# Safe navigation helper (borrowed & cleaned)
+# =========================
+
+async def _safe_goto_page(page, url: str, *, max_retries: int = 2) -> bool:
+    """
+    Navigate to a URL with retries using domcontentloaded.
+    Avoids networkidle & hard-crashes loops.
+    """
+    for attempt in range(1, max_retries + 1):
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            # Small grace period for JS
+            await page.wait_for_load_state("domcontentloaded")
+            return True
+        except Exception as e:
+            print(f"❌ Navigation attempt {attempt} to {url} failed: {e}")
+            if attempt < max_retries:
+                await asyncio.sleep(1)
+    return False
 
 
 # =========================
@@ -290,17 +323,14 @@ async def run_with_retries(
     per_page: int = 30,
     headless: bool = True,
     usd_rate: float = 1.28,
-    mobile: bool = False,  # kept for compatibility, not heavily used
+    mobile: bool = False,  # kept for compatibility; not actively used
     smoke: bool = False,
     max_retries: int = 2,
 ) -> Dict[str, Any]:
-    """
-    Wrapper that retries run() a few times and always returns a structured dict.
-    """
     last_error: Optional[str] = None
 
-    for attempt in range(max_retries):
-        print(f"🔄 Attempt {attempt + 1}/{max_retries} for query='{query}'")
+    for attempt in range(1, max_retries + 1):
+        print(f"🔄 Attempt {attempt}/{max_retries} for query='{query}'")
         try:
             result = await run(
                 query=query,
@@ -314,21 +344,21 @@ async def run_with_retries(
 
             if result.get("success"):
                 print(
-                    f"✅ Success on attempt {attempt + 1} "
+                    f"✅ Success on attempt {attempt} "
                     f"with {result.get('count', 0)} items"
                 )
                 return result
 
             last_error = result.get("error") or "Unknown error"
-            print(f"⚠️ Attempt {attempt + 1} failed logically: {last_error}")
+            print(f"⚠️ Attempt {attempt} failed logically: {last_error}")
 
         except Exception as e:
             last_error = str(e)
-            print(f"❌ Exception in attempt {attempt + 1}: {e}")
+            print(f"❌ Exception in attempt {attempt}: {e}")
             print(traceback.format_exc())
 
-        if attempt < max_retries - 1:
-            wait = 2 ** attempt
+        if attempt < max_retries:
+            wait = 2 ** (attempt - 1)
             print(f"⏳ Waiting {wait}s before retry...")
             await asyncio.sleep(wait)
 
@@ -343,6 +373,10 @@ async def run_with_retries(
         "elapsed_sec": 0,
     }
 
+
+# =========================
+# Single-attempt run
+# =========================
 
 async def run(
     query: str,
@@ -368,13 +402,14 @@ async def run(
             # Smoke test path
             if smoke:
                 page = await context.new_page()
-                await page.goto("https://example.com", wait_until="domcontentloaded")
-                title = await page.title()
+                ok = await _safe_goto_page(page, "https://example.com")
+                title = await page.title() if ok else "navigation-failed"
                 await browser.close()
                 return {
-                    "success": True,
+                    "success": ok,
                     "title": title,
                     "elapsed_sec": round(time.time() - start_time, 3),
+                    **({} if ok else {"error": "Failed to load example.com"}),
                 }
 
             search_page = await context.new_page()
@@ -387,27 +422,18 @@ async def run(
                     search_url = _build_search_url(query, page_num, mobile=False)
                     print(f"🔍 Searching: {search_url}")
 
-                    try:
-                        await asyncio.sleep(random.uniform(1, 2))
-                        await search_page.goto(
-                            search_url,
-                            wait_until="domcontentloaded",
-                            timeout=45000,
-                        )
-                        await search_page.wait_for_load_state("networkidle")
-                        print("✅ Search page loaded successfully")
-                    except PWTimeout:
-                        print(f"❌ Timeout loading search page {page_num}")
-                        continue
-                    except Exception as e:
-                        print(f"❌ Error loading search page {page_num}: {e}")
+                    await asyncio.sleep(random.uniform(0.5, 1.5))
+                    if not await _safe_goto_page(search_page, search_url):
+                        print(f"❌ Failed to load search page {page_num}")
                         continue
 
-                    # Scroll a bit to load more items
-                    for _ in range(3):
-                        await search_page.mouse.wheel(0, random.randint(800, 1600))
+                    print("✅ Search page loaded successfully")
+
+                    # Light scroll to trigger lazy loads
+                    for _ in range(2):
+                        await search_page.mouse.wheel(0, random.randint(400, 800))
                         await search_page.wait_for_timeout(
-                            random.randint(200, 600)
+                            random.randint(150, 350)
                         )
 
                     # Collect candidate items from the search page
@@ -480,8 +506,9 @@ async def run(
 
                     print(f"📦 Found {len(items)} items on page {page_num}")
 
-                    # Process only first 10 items to stay resource-light
-                    for idx, item in enumerate(items[:10], start=1):
+                    # To keep Railway stable: only visit a few items per page
+                    max_items_per_page = min(5, per_page - len(all_items))
+                    for idx, item in enumerate(items[:max_items_per_page], start=1):
                         if len(all_items) >= per_page:
                             break
 
@@ -496,17 +523,19 @@ async def run(
                             continue
                         seen_urls.add(clean_url)
 
-                        print(f"🛒 Visiting ({idx}/10): {item['title'][:80]}")
+                        print(f"🛒 Visiting ({idx}/{max_items_per_page}): {item['title'][:80]}")
 
                         item_page = await context.new_page()
                         try:
-                            await asyncio.sleep(random.uniform(0.8, 1.6))
-                            await item_page.goto(
-                                raw_url,
-                                wait_until="domcontentloaded",
-                                timeout=30000,
-                            )
-                            await item_page.wait_for_load_state("networkidle")
+                            await asyncio.sleep(random.uniform(0.7, 1.5))
+
+                            ok = await _safe_goto_page(item_page, raw_url)
+                            if not ok:
+                                print("❌ Failed to load item page after retries")
+                                continue
+
+                            # Extra tiny wait; no networkidle
+                            await item_page.wait_for_timeout(500)
 
                             price_gbp, sold_info = await _extract_item_price_debug(
                                 item_page
@@ -525,18 +554,14 @@ async def run(
                                 parsed = _parse_price_to_gbp(search_price_text)
                                 if parsed is not None:
                                     price_gbp = parsed
-                                    print(
-                                        f"🔄 Using search result price: £{price_gbp}"
-                                    )
+                                    print(f"🔄 Using search result price: £{price_gbp}")
 
                             if not shipping and search_shipping_text:
                                 shipping = search_shipping_text
 
                             sold_item = SoldItem(
                                 title=item["title"]
-                                .replace(
-                                    "Opens in a new window or tab", ""
-                                )
+                                .replace("Opens in a new window or tab", "")
                                 .strip(),
                                 price_text=(
                                     f"£{price_gbp:.2f}"
@@ -559,9 +584,7 @@ async def run(
                             )
 
                         except Exception as e:
-                            print(
-                                f"❌ Failed to process {item['title'][:80]}: {e}"
-                            )
+                            print(f"❌ Failed to process {item['title'][:80]}: {e}")
                             print(traceback.format_exc())
                         finally:
                             await item_page.close()
@@ -588,18 +611,17 @@ async def run(
             "elapsed_sec": round(time.time() - start_time, 3),
         }
 
-    # Decide success based on items
     success = len(all_items) > 0
 
     return {
         "success": success,
+        "error": None if success else "No items collected",
         "query": query,
         "pages_requested": pages,
         "per_page_requested": per_page,
         "count": len(all_items),
         "items": all_items,
         "elapsed_sec": round(time.time() - start_time, 3),
-        **({} if success else {"error": "No items collected"}),
     }
 
 
