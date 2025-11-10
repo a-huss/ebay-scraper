@@ -7,7 +7,7 @@ import traceback
 from dataclasses import dataclass, asdict
 from typing import List, Dict, Any, Optional, Tuple
 
-from playwright.async_api import async_playwright, TimeoutError as PWTimeout
+from playwright.async_api import async_playwright
 
 # =========================
 # Data Model
@@ -31,14 +31,13 @@ class SoldItem:
 # =========================
 
 def _parse_price_to_gbp(price_text: str) -> Optional[float]:
-    """Parse price text to GBP float - handles both GBP and USD."""
+    """Parse price text to GBP float - handles both GBP and USD and a few loose patterns."""
     if not price_text:
         return None
 
-    # Clean the text
     cleaned = price_text.strip()
-    
-    # GBP patterns - more comprehensive
+
+    # GBP patterns
     gbp_patterns = [
         r"£\s*([0-9][0-9,]*(?:\.[0-9]{2})?)",
         r"GBP\s*([0-9][0-9,]*(?:\.[0-9]{2})?)",
@@ -52,7 +51,7 @@ def _parse_price_to_gbp(price_text: str) -> Optional[float]:
             except ValueError:
                 pass
 
-    # USD patterns - more comprehensive  
+    # USD patterns
     usd_patterns = [
         r"US\s*\$\s*([0-9][0-9,]*(?:\.[0-9]{2})?)",
         r"\$\s*([0-9][0-9,]*(?:\.[0-9]{2})?)",
@@ -65,11 +64,11 @@ def _parse_price_to_gbp(price_text: str) -> Optional[float]:
         if m:
             try:
                 usd = float(m.group(1).replace(",", ""))
-                return round(usd * 0.78, 2)  # USD to GBP conversion
+                return round(usd * 0.78, 2)
             except ValueError:
                 pass
 
-    # Try pure number patterns (common in search results)
+    # Pure number pattern (fallback)
     pure_number = re.search(r"^\s*([0-9][0-9,]*(?:\.[0-9]{2})?)\s*$", cleaned)
     if pure_number:
         try:
@@ -96,17 +95,17 @@ def _build_search_url(query: str, page: int, mobile: bool) -> str:
 
 
 # =========================
-# Extraction helpers - IMPROVED PRICE DETECTION
+# Extraction helpers
 # =========================
 
 async def _extract_item_price_debug(page) -> Tuple[Optional[float], Optional[str]]:
-    """Extract price (GBP) and sold info from an item page, with enhanced detection."""
+    """Extract price (GBP) + sold info from an item page with layered strategies."""
     print("🔍 Debug: Looking for price on item page...")
 
     price_gbp: Optional[float] = None
     sold_info: Optional[str] = None
 
-    # STRATEGY 1: Try modern eBay selectors first
+    # Strategy 1: modern selectors
     modern_selectors = [
         '.x-price-primary span',
         '[data-testid="x-price-primary"] span',
@@ -115,36 +114,31 @@ async def _extract_item_price_debug(page) -> Tuple[Optional[float], Optional[str
         '.ux-textspans--BOLD',
         '[data-testid="x-price-0"] .ux-textspans',
     ]
-
     for selector in modern_selectors:
         try:
             locator = page.locator(selector)
             count = await locator.count()
             if count == 0:
                 continue
-
-            for i in range(min(count, 5)):  # Check more elements
-                try:
-                    text = await locator.nth(i).text_content()
-                    if not text:
-                        continue
-                    cleaned = text.strip()
-                    if not cleaned:
-                        continue
-                    print(f"💰 Modern selector ({selector}): '{cleaned}'")
-                    parsed = _parse_price_to_gbp(cleaned)
-                    if parsed is not None:
-                        price_gbp = parsed
-                        print(f"✅ Parsed price from modern selector: £{price_gbp}")
-                        break
-                except Exception as e:
+            for i in range(min(count, 5)):
+                text = await locator.nth(i).text_content()
+                if not text:
                     continue
+                cleaned = text.strip()
+                if not cleaned:
+                    continue
+                print(f"💰 Modern selector ({selector}): '{cleaned}'")
+                parsed = _parse_price_to_gbp(cleaned)
+                if parsed is not None:
+                    price_gbp = parsed
+                    print(f"✅ Parsed price from modern selector: £{price_gbp}")
+                    break
             if price_gbp is not None:
                 break
         except Exception:
             continue
 
-    # STRATEGY 2: Try legacy eBay selectors
+    # Strategy 2: legacy selectors
     if price_gbp is None:
         legacy_selectors = [
             '#prcIsum',
@@ -157,7 +151,6 @@ async def _extract_item_price_debug(page) -> Tuple[Optional[float], Optional[str
             '#prcIsum_bidPrice',
             '.vi-price-width',
         ]
-        
         for selector in legacy_selectors:
             try:
                 locator = page.locator(selector)
@@ -174,11 +167,10 @@ async def _extract_item_price_debug(page) -> Tuple[Optional[float], Optional[str
             except Exception:
                 continue
 
-    # STRATEGY 3: Search for price patterns in the entire page content
+    # Strategy 3: scan HTML for price-like patterns
     if price_gbp is None:
         try:
             content = await page.content()
-            # Look for common price patterns in the HTML
             price_patterns = [
                 r'£\s*\d+[\d,]*\.?\d*',
                 r'\$\s*\d+[\d,]*\.?\d*',
@@ -186,12 +178,11 @@ async def _extract_item_price_debug(page) -> Tuple[Optional[float], Optional[str
                 r'"amount":"(\d+[\d,]*\.?\d*)"',
                 r'data-price="(\d+[\d,]*\.?\d*)"',
             ]
-            
             for pattern in price_patterns:
                 matches = re.findall(pattern, content, re.IGNORECASE)
                 for match in matches:
                     if isinstance(match, tuple):
-                        match = match[0]  # Get first group if regex has groups
+                        match = match[0]
                     parsed = _parse_price_to_gbp(str(match))
                     if parsed is not None:
                         price_gbp = parsed
@@ -202,32 +193,34 @@ async def _extract_item_price_debug(page) -> Tuple[Optional[float], Optional[str
         except Exception as e:
             print(f"⚠️ Error scanning page content: {e}")
 
-    # STRATEGY 4: Look for JSON-LD structured data (modern eBay)
+    # Strategy 4: JSON-LD (structured data)
     if price_gbp is None:
         try:
-            json_ld_scripts = await page.locator('script[type="application/ld+json"]').all()
-            for script in json_ld_scripts:
+            scripts = page.locator('script[type="application/ld+json"]')
+            count = await scripts.count()
+            for i in range(count):
                 try:
-                    content = await script.text_content()
-                    if content and '"price"' in content:
-                        # Simple extraction from JSON
-                        price_match = re.search(r'"price"\s*:\s*"([^"]+)"', content)
-                        if price_match:
-                            price_str = price_match.group(1)
-                            parsed = _parse_price_to_gbp(price_str)
-                            if parsed is not None:
-                                price_gbp = parsed
-                                print(f"📊 Found price in JSON-LD: {price_str} -> £{price_gbp}")
-                                break
+                    content = await scripts.nth(i).text_content()
+                    if not content or '"price"' not in content:
+                        continue
+                    m = re.search(r'"price"\s*:\s*"([^"]+)"', content)
+                    if not m:
+                        continue
+                    price_str = m.group(1)
+                    parsed = _parse_price_to_gbp(price_str)
+                    if parsed is not None:
+                        price_gbp = parsed
+                        print(f"📊 Found price in JSON-LD: {price_str} -> £{price_gbp}")
+                        break
                 except Exception:
                     continue
         except Exception:
             pass
 
-    # Extract sold info with better selectors
+    # Sold info
     sold_selectors = [
         "span.ux-textspans:has-text('Ended') + span.ux-textspans",
-        "span.ux-textspans:has-text('Sold') + span.ux-textspans", 
+        "span.ux-textspans:has-text('Sold') + span.ux-textspans",
         "div.ux-labels-values__labels:has(span:has-text('Ended')) + div .ux-textspans",
         "div.ux-labels-values__labels:has(span:has-text('Sold')) + div .ux-textspans",
         "[data-testid='x-sold-date'] .ux-textspans",
@@ -236,7 +229,6 @@ async def _extract_item_price_debug(page) -> Tuple[Optional[float], Optional[str
         ".vi-bboxrev-pos",
         ".vi-notify-new-bg-dBtm",
     ]
-    
     for selector in sold_selectors:
         try:
             locator = page.locator(selector)
@@ -253,12 +245,12 @@ async def _extract_item_price_debug(page) -> Tuple[Optional[float], Optional[str
 
 
 async def _extract_additional_info(page) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    """Extract condition, shipping and image from item page."""
+    """Extract condition, shipping, and image from item page."""
     condition = None
     shipping = None
     image = None
 
-    # Condition - modern selectors first
+    # Condition
     condition_selectors = [
         '.x-item-condition-text .ux-textspans',
         '[data-testid="x-item-condition-text"] .ux-textspans',
@@ -297,7 +289,7 @@ async def _extract_additional_info(page) -> Tuple[Optional[str], Optional[str], 
         except Exception:
             pass
 
-    # Image - prioritize high quality images
+    # Image
     image_selectors = [
         '#icImg',
         '#mainImg',
@@ -313,16 +305,10 @@ async def _extract_additional_info(page) -> Tuple[Optional[str], Optional[str], 
             if await locator.count() > 0:
                 src = await locator.first.get_attribute("src")
                 if src:
-                    # Prefer larger images over thumbnails
-                    if 's-l64' in src or 's-l50' in src:
-                        continue  # Skip small thumbnails
+                    # Prefer higher-res if pattern allows
+                    if "s-l500" in src:
+                        src = src.replace("s-l500", "s-l1600")
                     image = src
-                    # Try to get higher resolution version
-                    if 's-l1600' in src:
-                        break  # This is already high quality
-                    elif 's-l500' in src:
-                        high_res = src.replace('s-l500', 's-l1600')
-                        image = high_res
                     break
         except Exception:
             pass
@@ -331,17 +317,21 @@ async def _extract_additional_info(page) -> Tuple[Optional[str], Optional[str], 
 
 
 # =========================
-# Browser context (stable for Railway)
+# Browser context (Railway-safe)
 # =========================
 
 async def _new_browser_context(pw, *, headless: bool):
-    """Stable browser context for constrained containers (Railway)."""
+    """
+    Stable browser context for Railway:
+    - minimal but required flags
+    - block heavy assets
+    """
     try:
         browser = await pw.chromium.launch(
             headless=headless,
             args=[
                 "--no-sandbox",
-                "--disable-setuid-sandbox", 
+                "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
             ],
@@ -367,9 +357,10 @@ async def _new_browser_context(pw, *, headless: bool):
         ignore_https_errors=True,
     )
 
-    # Block heavy assets but keep CSS for proper layout
-    async def block_assets(route, request):
-        if request.resource_type in ("image", "media", "font"):
+    # Correct Playwright route handler signature
+    async def block_assets(route):
+        req = route.request
+        if req.resource_type in ("image", "media", "font"):
             await route.abort()
         else:
             await route.continue_()
@@ -383,11 +374,12 @@ async def _new_browser_context(pw, *, headless: bool):
 
 
 async def _safe_goto_page(page, url: str, *, max_retries: int = 2) -> bool:
-    """Navigate to a URL with retries using domcontentloaded."""
+    """Navigate safely using domcontentloaded, with retries."""
     for attempt in range(1, max_retries + 1):
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            await page.wait_for_load_state("domcontentloaded")
+            # tiny pause instead of aggressive load_state loops
+            await page.wait_for_timeout(300)
             return True
         except Exception as e:
             print(f"❌ Navigation attempt {attempt} to {url} failed: {e}")
@@ -397,7 +389,7 @@ async def _safe_goto_page(page, url: str, *, max_retries: int = 2) -> bool:
 
 
 # =========================
-# Core run + retries 
+# Core run + retries
 # =========================
 
 async def run_with_retries(
@@ -455,6 +447,10 @@ async def run_with_retries(
     }
 
 
+# =========================
+# Single run
+# =========================
+
 async def run(
     query: str,
     *,
@@ -465,7 +461,7 @@ async def run(
     mobile: bool = False,
     smoke: bool = False,
 ) -> Dict[str, Any]:
-    """Single-attempt scrape with improved price detection."""
+    """Single-attempt scrape with robust extraction and Railway-safe behavior."""
     start_time = time.time()
     all_items: List[Dict[str, Any]] = []
     seen_urls = set()
@@ -474,6 +470,7 @@ async def run(
         async with async_playwright() as pw:
             browser, context = await _new_browser_context(pw, headless=headless)
 
+            # Smoke test
             if smoke:
                 page = await context.new_page()
                 ok = await _safe_goto_page(page, "https://example.com")
@@ -496,19 +493,20 @@ async def run(
                     search_url = _build_search_url(query, page_num, mobile=False)
                     print(f"🔍 Searching: {search_url}")
 
-                    await asyncio.sleep(random.uniform(0.5, 1.5))
+                    await asyncio.sleep(random.uniform(0.3, 0.8))
                     if not await _safe_goto_page(search_page, search_url):
                         print(f"❌ Failed to load search page {page_num}")
                         continue
 
                     print("✅ Search page loaded successfully")
 
-                    # Light scroll to trigger lazy loads
-                    for _ in range(2):
-                        await search_page.mouse.wheel(0, random.randint(400, 800))
-                        await search_page.wait_for_timeout(random.randint(150, 350))
+                    # Very light scroll via JS to trigger lazy loading, not mouse.wheel
+                    await search_page.evaluate(
+                        "window.scrollTo(0, document.body.scrollHeight * 0.5);"
+                    )
+                    await search_page.wait_for_timeout(200)
 
-                    # Collect candidate items from search page
+                    # Collect candidate items
                     items = await search_page.evaluate(
                         """
                         (() => {
@@ -549,7 +547,7 @@ async def run(
                               shipping_text = shippingEl.textContent.trim();
                             }
 
-                            out.push({title, url: href, image, price_text, shipping_text});
+                            out.push({ title, url: href, image, price_text, shipping_text });
                             seen.add(href);
                           }
                           return out;
@@ -559,7 +557,6 @@ async def run(
 
                     print(f"📦 Found {len(items)} items on page {page_num}")
 
-                    # Process items with improved price detection
                     max_items_per_page = min(5, per_page - len(all_items))
                     for idx, item in enumerate(items[:max_items_per_page], start=1):
                         if len(all_items) >= per_page:
@@ -580,24 +577,22 @@ async def run(
 
                         item_page = await context.new_page()
                         try:
-                            await asyncio.sleep(random.uniform(0.7, 1.5))
+                            await asyncio.sleep(random.uniform(0.5, 1.2))
 
                             ok = await _safe_goto_page(item_page, raw_url)
                             if not ok:
                                 print("❌ Failed to load item page after retries")
                                 continue
 
-                            # Wait a bit more for dynamic content
-                            await item_page.wait_for_timeout(1000)
+                            await item_page.wait_for_timeout(500)
 
-                            # Extract data with improved methods
                             price_gbp, sold_info = await _extract_item_price_debug(item_page)
                             condition, shipping, image = await _extract_additional_info(item_page)
 
-                            # Use search result price as fallback
                             search_price_text = item.get("price_text") or ""
                             search_shipping_text = item.get("shipping_text") or ""
 
+                            # Fallback to search price if needed
                             if price_gbp is None and search_price_text:
                                 parsed = _parse_price_to_gbp(search_price_text)
                                 if parsed is not None:
@@ -607,7 +602,6 @@ async def run(
                             if not shipping and search_shipping_text:
                                 shipping = search_shipping_text
 
-                            # Create the item
                             sold_item = SoldItem(
                                 title=item["title"].replace("Opens in a new window or tab", "").strip(),
                                 price_text=f"£{price_gbp:.2f}" if price_gbp is not None else search_price_text or "N/A",
@@ -617,7 +611,7 @@ async def run(
                                 condition=condition,
                                 sold_info=sold_info,
                                 url=clean_url,
-                                image=image,
+                                image=image or item.get("image"),
                             )
 
                             all_items.append(asdict(sold_item))
@@ -662,5 +656,5 @@ async def run(
     }
 
 
-# Backwards-compatible entrypoint used by FastAPI
+# Backwards-compatible entrypoint
 main = run_with_retries
