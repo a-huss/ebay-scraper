@@ -91,6 +91,7 @@ def _build_search_url(query: str, page: int, mobile: bool) -> str:
     return (
         f"{base}/sch/i.html?_nkw={q}"
         f"&LH_Sold=1&LH_Complete=1&_sop=13&_ipg=50&_pgn={page}"
+        f"&LH_ItemCondition=1000"  # NEW condition only
     )
 
 
@@ -632,7 +633,7 @@ async def run(
                         except Exception as e:
                             print(f"⚠️ Could not check page content: {e}")
 
-                    # Process items - CHANGED: cap increased from 5 to 10
+                    # Process items - cap increased from 5 to 10
                     max_items_per_page = min(10, per_page - len(all_items))
                     for idx, item in enumerate(items[:max_items_per_page], start=1):
                         if len(all_items) >= per_page:
@@ -664,6 +665,11 @@ async def run(
 
                             price_gbp, sold_info = await _extract_item_price_debug(item_page)
                             condition, shipping, image = await _extract_additional_info(item_page)
+
+                            # FILTER: Only keep NEW condition items
+                            if condition and not any(keyword in condition.lower() for keyword in ['new', 'new with box', 'new without box', 'new with tags']):
+                                print(f"⏩ Skipping non-new item (condition: {condition})")
+                                continue
 
                             search_price_text = item.get("price_text") or ""
                             search_shipping_text = item.get("shipping_text") or ""
@@ -697,7 +703,7 @@ async def run(
                             )
 
                             all_items.append(asdict(sold_item))
-                            print(f"✅ Collected: {sold_item.title[:80]} | {sold_item.price_text}")
+                            print(f"✅ Collected NEW item: {sold_item.title[:80]} | {sold_item.price_text} | {sold_item.condition}")
 
                         except Exception as e:
                             print(f"❌ Failed item ({item['title'][:80]}): {e}")
