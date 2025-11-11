@@ -7,7 +7,7 @@ import traceback
 from dataclasses import dataclass, asdict
 from typing import List, Dict, Any, Optional, Tuple
 
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
 # =========================
 # Data Model
@@ -31,7 +31,7 @@ class SoldItem:
 # =========================
 
 def _parse_price_to_gbp(price_text: str) -> Optional[float]:
-    """Parse price text to GBP float - handles both GBP and USD and a few loose patterns."""
+    """Parse price text to GBP float - handles both GBP and USD and loose formats."""
     if not price_text:
         return None
 
@@ -39,9 +39,9 @@ def _parse_price_to_gbp(price_text: str) -> Optional[float]:
 
     # GBP patterns
     gbp_patterns = [
-        r"£\s*([0-9][0-9,]*(?:\.[0-9]{2})?)",
-        r"GBP\s*([0-9][0-9,]*(?:\.[0-9]{2})?)",
-        r"([0-9][0-9,]*(?:\.[0-9]{2})?)\s*GBP",
+        r"£\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)",
+        r"GBP\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)",
+        r"([0-9][0-9,]*(?:\.[0-9]{1,2})?)\s*GBP",
     ]
     for pattern in gbp_patterns:
         m = re.search(pattern, cleaned, re.IGNORECASE)
@@ -53,11 +53,11 @@ def _parse_price_to_gbp(price_text: str) -> Optional[float]:
 
     # USD patterns
     usd_patterns = [
-        r"US\s*\$\s*([0-9][0-9,]*(?:\.[0-9]{2})?)",
-        r"\$\s*([0-9][0-9,]*(?:\.[0-9]{2})?)",
-        r"USD\s*([0-9][0-9,]*(?:\.[0-9]{2})?)",
-        r"([0-9][0-9,]*(?:\.[0-9]{2})?)\s*USD",
-        r"([0-9][0-9,]*(?:\.[0-9]{2})?)\s*US\$",
+        r"US\s*\$\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)",
+        r"\$\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)",
+        r"USD\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)",
+        r"([0-9][0-9,]*(?:\.[0-9]{1,2})?)\s*USD",
+        r"([0-9][0-9,]*(?:\.[0-9]{1,2})?)\s*US\$",
     ]
     for pattern in usd_patterns:
         m = re.search(pattern, cleaned, re.IGNORECASE)
@@ -68,8 +68,8 @@ def _parse_price_to_gbp(price_text: str) -> Optional[float]:
             except ValueError:
                 pass
 
-    # Pure number pattern (fallback)
-    pure_number = re.search(r"^\s*([0-9][0-9,]*(?:\.[0-9]{2})?)\s*$", cleaned)
+    # Pure number fallback
+    pure_number = re.search(r"^\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)\s*$", cleaned)
     if pure_number:
         try:
             return float(pure_number.group(1).replace(",", ""))
@@ -99,7 +99,7 @@ def _build_search_url(query: str, page: int, mobile: bool) -> str:
 # =========================
 
 async def _extract_item_price_debug(page) -> Tuple[Optional[float], Optional[str]]:
-    """Extract price (GBP) + sold info from an item page with layered strategies."""
+    """Extract price (GBP) and sold info from an item page, with multiple strategies."""
     print("🔍 Debug: Looking for price on item page...")
 
     price_gbp: Optional[float] = None
@@ -121,18 +121,21 @@ async def _extract_item_price_debug(page) -> Tuple[Optional[float], Optional[str
             if count == 0:
                 continue
             for i in range(min(count, 5)):
-                text = await locator.nth(i).text_content()
-                if not text:
+                try:
+                    text = await locator.nth(i).text_content()
+                    if not text:
+                        continue
+                    cleaned = text.strip()
+                    if not cleaned:
+                        continue
+                    print(f"💰 Modern selector ({selector}): '{cleaned}'")
+                    parsed = _parse_price_to_gbp(cleaned)
+                    if parsed is not None:
+                        price_gbp = parsed
+                        print(f"✅ Parsed price from modern selector: £{price_gbp}")
+                        break
+                except Exception:
                     continue
-                cleaned = text.strip()
-                if not cleaned:
-                    continue
-                print(f"💰 Modern selector ({selector}): '{cleaned}'")
-                parsed = _parse_price_to_gbp(cleaned)
-                if parsed is not None:
-                    price_gbp = parsed
-                    print(f"✅ Parsed price from modern selector: £{price_gbp}")
-                    break
             if price_gbp is not None:
                 break
         except Exception:
@@ -167,7 +170,7 @@ async def _extract_item_price_debug(page) -> Tuple[Optional[float], Optional[str
             except Exception:
                 continue
 
-    # Strategy 3: scan HTML for price-like patterns
+    # Strategy 3: search HTML content
     if price_gbp is None:
         try:
             content = await page.content()
@@ -193,7 +196,7 @@ async def _extract_item_price_debug(page) -> Tuple[Optional[float], Optional[str
         except Exception as e:
             print(f"⚠️ Error scanning page content: {e}")
 
-    # Strategy 4: JSON-LD (structured data)
+    # Strategy 4: JSON-LD structured data
     if price_gbp is None:
         try:
             scripts = page.locator('script[type="application/ld+json"]')
@@ -201,19 +204,19 @@ async def _extract_item_price_debug(page) -> Tuple[Optional[float], Optional[str
             for i in range(count):
                 try:
                     content = await scripts.nth(i).text_content()
-                    if not content or '"price"' not in content:
-                        continue
-                    m = re.search(r'"price"\s*:\s*"([^"]+)"', content)
-                    if not m:
-                        continue
-                    price_str = m.group(1)
-                    parsed = _parse_price_to_gbp(price_str)
-                    if parsed is not None:
-                        price_gbp = parsed
-                        print(f"📊 Found price in JSON-LD: {price_str} -> £{price_gbp}")
-                        break
+                    if content and '"price"' in content:
+                        m = re.search(r'"price"\s*:\s*"([^"]+)"', content)
+                        if m:
+                            price_str = m.group(1)
+                            parsed = _parse_price_to_gbp(price_str)
+                            if parsed is not None:
+                                price_gbp = parsed
+                                print(f"📊 Found price in JSON-LD: {price_str} -> £{price_gbp}")
+                                break
                 except Exception:
                     continue
+                if price_gbp is not None:
+                    break
         except Exception:
             pass
 
@@ -245,7 +248,7 @@ async def _extract_item_price_debug(page) -> Tuple[Optional[float], Optional[str
 
 
 async def _extract_additional_info(page) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    """Extract condition, shipping, and image from item page."""
+    """Extract condition, shipping and image from item page."""
     condition = None
     shipping = None
     image = None
@@ -305,10 +308,13 @@ async def _extract_additional_info(page) -> Tuple[Optional[str], Optional[str], 
             if await locator.count() > 0:
                 src = await locator.first.get_attribute("src")
                 if src:
-                    # Prefer higher-res if pattern allows
-                    if "s-l500" in src:
-                        src = src.replace("s-l500", "s-l1600")
-                    image = src
+                    # Prefer non-tiny images & upgrade if possible
+                    if 's-l1600' in src:
+                        image = src
+                    elif 's-l500' in src:
+                        image = src.replace('s-l500', 's-l1600')
+                    else:
+                        image = src
                     break
         except Exception:
             pass
@@ -317,15 +323,11 @@ async def _extract_additional_info(page) -> Tuple[Optional[str], Optional[str], 
 
 
 # =========================
-# Browser context (Railway-safe)
+# Browser context (Railway-friendly)
 # =========================
 
 async def _new_browser_context(pw, *, headless: bool):
-    """
-    Stable browser context for Railway:
-    - minimal but required flags
-    - block heavy assets
-    """
+    """Stable browser context for constrained containers (Railway)."""
     try:
         browser = await pw.chromium.launch(
             headless=headless,
@@ -357,7 +359,7 @@ async def _new_browser_context(pw, *, headless: bool):
         ignore_https_errors=True,
     )
 
-    # Correct Playwright route handler signature
+    # Block heavy assets (keep CSS for layout)
     async def block_assets(route):
         req = route.request
         if req.resource_type in ("image", "media", "font"):
@@ -374,12 +376,11 @@ async def _new_browser_context(pw, *, headless: bool):
 
 
 async def _safe_goto_page(page, url: str, *, max_retries: int = 2) -> bool:
-    """Navigate safely using domcontentloaded, with retries."""
+    """Navigate with retries using domcontentloaded."""
     for attempt in range(1, max_retries + 1):
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            # tiny pause instead of aggressive load_state loops
-            await page.wait_for_timeout(300)
+            await page.wait_for_load_state("domcontentloaded")
             return True
         except Exception as e:
             print(f"❌ Navigation attempt {attempt} to {url} failed: {e}")
@@ -404,6 +405,7 @@ async def run_with_retries(
     max_retries: int = 2,
 ) -> Dict[str, Any]:
     last_error: Optional[str] = None
+    start_all = time.time()
 
     for attempt in range(1, max_retries + 1):
         print(f"🔄 Attempt {attempt}/{max_retries} for query='{query}'")
@@ -420,6 +422,7 @@ async def run_with_retries(
 
             if result.get("success"):
                 print(f"✅ Success on attempt {attempt} with {result.get('count', 0)} items")
+                result["elapsed_sec"] = round(time.time() - start_all, 3)
                 return result
 
             last_error = result.get("error") or "Unknown error"
@@ -443,13 +446,9 @@ async def run_with_retries(
         "per_page_requested": per_page,
         "count": 0,
         "items": [],
-        "elapsed_sec": 0,
+        "elapsed_sec": round(time.time() - start_all, 3),
     }
 
-
-# =========================
-# Single run
-# =========================
 
 async def run(
     query: str,
@@ -461,7 +460,7 @@ async def run(
     mobile: bool = False,
     smoke: bool = False,
 ) -> Dict[str, Any]:
-    """Single-attempt scrape with robust extraction and Railway-safe behavior."""
+    """Single-attempt scrape with stable navigation + robust price detection."""
     start_time = time.time()
     all_items: List[Dict[str, Any]] = []
     seen_urls = set()
@@ -470,7 +469,6 @@ async def run(
         async with async_playwright() as pw:
             browser, context = await _new_browser_context(pw, headless=headless)
 
-            # Smoke test
             if smoke:
                 page = await context.new_page()
                 ok = await _safe_goto_page(page, "https://example.com")
@@ -493,63 +491,87 @@ async def run(
                     search_url = _build_search_url(query, page_num, mobile=False)
                     print(f"🔍 Searching: {search_url}")
 
-                    await asyncio.sleep(random.uniform(0.3, 0.8))
+                    await asyncio.sleep(random.uniform(0.5, 1.5))
                     if not await _safe_goto_page(search_page, search_url):
                         print(f"❌ Failed to load search page {page_num}")
                         continue
 
                     print("✅ Search page loaded successfully")
 
-                    # Very light scroll via JS to trigger lazy loading, not mouse.wheel
-                    await search_page.evaluate(
-                        "window.scrollTo(0, document.body.scrollHeight * 0.5);"
-                    )
-                    await search_page.wait_for_timeout(200)
+                    # Light scroll (avoid crashes)
+                    for _ in range(2):
+                        try:
+                            await search_page.mouse.wheel(0, random.randint(300, 700))
+                            await search_page.wait_for_timeout(random.randint(150, 300))
+                        except Exception as e:
+                            print(f"⚠️ Scroll failed (ignored): {e}")
+                            break
 
-                    # Collect candidate items
+                    # Robust search-page extraction
                     items = await search_page.evaluate(
                         """
                         (() => {
                           const out = [];
                           const seen = new Set();
-                          const nodes = Array.from(document.querySelectorAll('a[href*="/itm/"]'));
-                          
-                          for (const a of nodes) {
-                            const href = a.getAttribute('href') || '';
+
+                          const candidates = Array.from(
+                            document.querySelectorAll('li.s-item, div.s-item__wrapper, div.s-item')
+                          );
+
+                          for (const card of candidates) {
+                            const link =
+                              card.querySelector('a[href*="/itm/"]') ||
+                              card.querySelector('a.s-item__link');
+                            if (!link) continue;
+
+                            const href = link.getAttribute('href') || '';
                             if (!href || seen.has(href)) continue;
 
-                            let card = a.closest('li') || a.closest('[class*="s-item"]') || a.parentElement;
-
-                            const title = (
-                              (card && (card.querySelector('.s-item__title, h3.s-item__title, [role="heading"]')?.textContent || '')) ||
-                              (a.textContent || '')
-                            ).trim();
-
-                            if (!title || title.toLowerCase().includes('shop on ebay')) {
+                            const titleEl =
+                              card.querySelector('.s-item__title') ||
+                              card.querySelector('h3.s-item__title') ||
+                              card.querySelector('[role="heading"]') ||
+                              link;
+                            const title = (titleEl.textContent || '').trim();
+                            if (!title ||
+                                title.toLowerCase().includes('shop on ebay')) {
                               continue;
                             }
 
                             let image = null;
-                            const imgEl = card?.querySelector('img');
+                            const imgEl = card.querySelector('img');
                             if (imgEl) {
-                              image = imgEl.getAttribute('src') || imgEl.getAttribute('data-src');
+                              image =
+                                imgEl.getAttribute('src') ||
+                                imgEl.getAttribute('data-src') ||
+                                imgEl.getAttribute('data-image-src');
                             }
 
                             let price_text = '';
-                            const priceEl = card?.querySelector('.s-item__price');
+                            const priceEl =
+                              card.querySelector('.s-item__price') ||
+                              card.querySelector('.s-item__detail--primary span') ||
+                              card.querySelector('[aria-label*="Sold"]') ||
+                              card.querySelector('[aria-label*="£"]') ||
+                              card.querySelector('[aria-label*="$"]');
                             if (priceEl) {
-                              price_text = priceEl.textContent.trim();
+                              price_text = (priceEl.textContent || '').trim();
                             }
 
                             let shipping_text = '';
-                            const shippingEl = card?.querySelector('.s-item__shipping, .s-item__logisticsCost');
+                            const shippingEl =
+                              card.querySelector('.s-item__shipping') ||
+                              card.querySelector('.s-item__logisticsCost') ||
+                              card.querySelector('[aria-label*="Postage"]') ||
+                              card.querySelector('[aria-label*="Shipping"]');
                             if (shippingEl) {
-                              shipping_text = shippingEl.textContent.trim();
+                              shipping_text = (shippingEl.textContent || '').trim();
                             }
 
                             out.push({ title, url: href, image, price_text, shipping_text });
                             seen.add(href);
                           }
+
                           return out;
                         })()
                         """
@@ -557,8 +579,8 @@ async def run(
 
                     print(f"📦 Found {len(items)} items on page {page_num}")
 
-                    max_items_per_page = min(5, per_page - len(all_items))
-                    for idx, item in enumerate(items[:max_items_per_page], start=1):
+                    max_items_this_page = min(5, per_page - len(all_items))
+                    for idx, item in enumerate(items[:max_items_this_page], start=1):
                         if len(all_items) >= per_page:
                             break
 
@@ -573,18 +595,18 @@ async def run(
                             continue
                         seen_urls.add(clean_url)
 
-                        print(f"🛒 Visiting ({idx}/{max_items_per_page}): {item['title'][:80]}")
+                        print(f"🛒 Visiting ({idx}/{max_items_this_page}): {item['title'][:80]}")
 
                         item_page = await context.new_page()
                         try:
-                            await asyncio.sleep(random.uniform(0.5, 1.2))
+                            await asyncio.sleep(random.uniform(0.7, 1.5))
 
                             ok = await _safe_goto_page(item_page, raw_url)
                             if not ok:
                                 print("❌ Failed to load item page after retries")
                                 continue
 
-                            await item_page.wait_for_timeout(500)
+                            await item_page.wait_for_timeout(800)
 
                             price_gbp, sold_info = await _extract_item_price_debug(item_page)
                             condition, shipping, image = await _extract_additional_info(item_page)
@@ -592,7 +614,6 @@ async def run(
                             search_price_text = item.get("price_text") or ""
                             search_shipping_text = item.get("shipping_text") or ""
 
-                            # Fallback to search price if needed
                             if price_gbp is None and search_price_text:
                                 parsed = _parse_price_to_gbp(search_price_text)
                                 if parsed is not None:
@@ -602,20 +623,32 @@ async def run(
                             if not shipping and search_shipping_text:
                                 shipping = search_shipping_text
 
+                            if not image and item.get("image"):
+                                image = item["image"]
+
                             sold_item = SoldItem(
-                                title=item["title"].replace("Opens in a new window or tab", "").strip(),
-                                price_text=f"£{price_gbp:.2f}" if price_gbp is not None else search_price_text or "N/A",
+                                title=item["title"].replace(
+                                    "Opens in a new window or tab", ""
+                                ).strip(),
+                                price_text=(
+                                    f"£{price_gbp:.2f}"
+                                    if price_gbp is not None
+                                    else search_price_text or "N/A"
+                                ),
                                 price_gbp=price_gbp,
                                 price_usd=_gbp_to_usd(price_gbp, usd_rate),
                                 shipping_text=shipping,
                                 condition=condition,
                                 sold_info=sold_info,
                                 url=clean_url,
-                                image=image or item.get("image"),
+                                image=image,
                             )
 
                             all_items.append(asdict(sold_item))
-                            print(f"✅ Collected: {sold_item.title[:80]} | Price: {sold_item.price_text}")
+                            print(
+                                f"✅ Collected: {sold_item.title[:80]} | "
+                                f"Price: {sold_item.price_text}"
+                            )
 
                         except Exception as e:
                             print(f"❌ Failed to process {item['title'][:80]}: {e}")
@@ -656,5 +689,5 @@ async def run(
     }
 
 
-# Backwards-compatible entrypoint
+# Backwards-compatible entrypoint used by FastAPI
 main = run_with_retries
