@@ -309,7 +309,7 @@ async def _new_browser_context(pw, *, headless: bool):
 
     user_agent = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit(537.36) (KHTML, like Gecko) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/120.0.0.0 Safari/537.36"
     )
     print(f"🕵️ Using User Agent: {user_agent[:50]}...")
@@ -323,10 +323,9 @@ async def _new_browser_context(pw, *, headless: bool):
         ignore_https_errors=True,
     )
 
-    # Correct route handler signature: only `route`
+    # Correct route handler signature
     async def block_assets(route):
-        r = route.request
-        if r.resource_type in ("image", "media", "font"):
+        if route.request.resource_type in ("image", "media", "font"):
             await route.abort()
         else:
             await route.continue_()
@@ -351,6 +350,154 @@ async def _safe_goto_page(page, url: str, *, max_retries: int = 2) -> bool:
             if attempt < max_retries:
                 await asyncio.sleep(1)
     return False
+
+
+# =========================
+# Item extraction from search page - FIXED VERSION
+# =========================
+
+async def _extract_items_from_search_page(page) -> List[Dict[str, Any]]:
+    """Extract items from search page with multiple fallback strategies."""
+    items = []
+    
+    # Strategy 1: Try the modern eBay layout first
+    try:
+        items = await page.evaluate(
+            """
+            () => {
+                const items = [];
+                // Modern eBay layout - look for s-item elements
+                const listings = document.querySelectorAll('.s-item__wrapper');
+                
+                for (const listing of listings) {
+                    try {
+                        const link = listing.querySelector('a.s-item__link');
+                        if (!link) continue;
+                        
+                        const href = link.getAttribute('href');
+                        if (!href || !href.includes('/itm/')) continue;
+                        
+                        const titleEl = listing.querySelector('.s-item__title');
+                        const title = titleEl ? titleEl.textContent.trim() : '';
+                        if (!title || title.includes('Shop on eBay')) continue;
+                        
+                        const priceEl = listing.querySelector('.s-item__price');
+                        const priceText = priceEl ? priceEl.textContent.trim() : '';
+                        
+                        const shippingEl = listing.querySelector('.s-item__shipping, .s-item__logisticsCost');
+                        const shippingText = shippingEl ? shippingEl.textContent.trim() : '';
+                        
+                        const imgEl = listing.querySelector('.s-item__image img');
+                        const image = imgEl ? (imgEl.getAttribute('src') || imgEl.getAttribute('data-src')) : null;
+                        
+                        items.push({
+                            title: title,
+                            url: href,
+                            price_text: priceText,
+                            shipping_text: shippingText,
+                            image: image
+                        });
+                    } catch (e) {
+                        // Skip problematic items
+                        continue;
+                    }
+                }
+                return items;
+            }
+            """
+        )
+        print(f"📦 Strategy 1 found {len(items)} items")
+    except Exception as e:
+        print(f"❌ Strategy 1 failed: {e}")
+        items = []
+
+    # Strategy 2: Fallback to broader selector if first strategy fails
+    if not items:
+        try:
+            items = await page.evaluate(
+                """
+                () => {
+                    const items = [];
+                    // Broader search for any eBay item links
+                    const links = document.querySelectorAll('a[href*="/itm/"]');
+                    
+                    for (const link of links) {
+                        try {
+                            const href = link.getAttribute('href');
+                            if (!href) continue;
+                            
+                            // Find the parent item container
+                            let container = link.closest('.s-item') || link.closest('li') || link.parentElement;
+                            if (!container) continue;
+                            
+                            const title = link.textContent.trim();
+                            if (!title || title.includes('Shop on eBay')) continue;
+                            
+                            const priceEl = container.querySelector('.s-item__price, .POSITIVE');
+                            const priceText = priceEl ? priceEl.textContent.trim() : '';
+                            
+                            const shippingEl = container.querySelector('.s-item__shipping');
+                            const shippingText = shippingEl ? shippingEl.textContent.trim() : '';
+                            
+                            const imgEl = container.querySelector('img');
+                            const image = imgEl ? (imgEl.getAttribute('src') || imgEl.getAttribute('data-src')) : null;
+                            
+                            // Avoid duplicates by checking URL
+                            if (!items.some(item => item.url === href)) {
+                                items.push({
+                                    title: title,
+                                    url: href,
+                                    price_text: priceText,
+                                    shipping_text: shippingText,
+                                    image: image
+                                });
+                            }
+                        } catch (e) {
+                            continue;
+                        }
+                    }
+                    return items;
+                }
+                """
+            )
+            print(f"📦 Strategy 2 found {len(items)} items")
+        except Exception as e:
+            print(f"❌ Strategy 2 failed: {e}")
+            items = []
+
+    # Strategy 3: Last resort - simple link extraction
+    if not items:
+        try:
+            items = await page.evaluate(
+                """
+                () => {
+                    const items = [];
+                    const links = document.querySelectorAll('a[href*="/itm/"]');
+                    
+                    for (const link of links) {
+                        const href = link.getAttribute('href');
+                        const title = link.textContent.trim();
+                        
+                        if (href && title && !title.includes('Shop on eBay')) {
+                            items.push({
+                                title: title,
+                                url: href,
+                                price_text: '',
+                                shipping_text: '',
+                                image: null
+                            });
+                        }
+                    }
+                    return items.slice(0, 20); // Limit to first 20
+                }
+                """
+            )
+            print(f"📦 Strategy 3 found {len(items)} items")
+        except Exception as e:
+            print(f"❌ Strategy 3 failed: {e}")
+            items = []
+
+    return items
 
 
 # =========================
@@ -426,7 +573,7 @@ async def run(
     mobile: bool = False,
     smoke: bool = False,
 ) -> Dict[str, Any]:
-    """Single-attempt scrape with stable evaluate and low memory usage."""
+    """Single-attempt scrape with robust item extraction."""
     start_time = time.time()
     all_items: List[Dict[str, Any]] = []
     seen_urls = set()
@@ -464,57 +611,28 @@ async def run(
 
                     print("✅ Search page loaded successfully")
 
-                    # Light scroll only (avoid crashes)
-                    try:
-                        await search_page.mouse.wheel(0, 600)
-                        await search_page.wait_for_timeout(200)
-                    except Exception as e:
-                        print(f"⚠️ Scroll skipped: {e}")
+                    # Wait a bit for content to render
+                    await search_page.wait_for_timeout(2000)
 
-                    # Safer, simpler evaluate (no crazy traversals)
-                    try:
-                        items = await search_page.evaluate(
-                            """
-                            () => {
-                              const out = [];
-                              const cards = document.querySelectorAll('.s-item');
-
-                              for (const card of cards) {
-                                const link = card.querySelector('a[href*="/itm/"]');
-                                if (!link) continue;
-
-                                const href = link.getAttribute('href') || '';
-                                if (!href) continue;
-
-                                const titleEl =
-                                  card.querySelector('.s-item__title, h3.s-item__title, [role="heading"]');
-                                const title = (titleEl?.textContent || link.textContent || '').trim();
-                                if (!title || title.toLowerCase().includes('shop on ebay')) continue;
-
-                                const imgEl = card.querySelector('img');
-                                const image =
-                                  imgEl?.getAttribute('src') || imgEl?.getAttribute('data-src') || null;
-
-                                const priceEl = card.querySelector('.s-item__price');
-                                const price_text = (priceEl?.textContent || '').trim();
-
-                                const shipEl = card.querySelector('.s-item__shipping, .s-item__logisticsCost');
-                                const shipping_text = (shipEl?.textContent || '').trim();
-
-                                out.push({ title, url: href, image, price_text, shipping_text });
-                              }
-
-                              return out;
-                            }
-                            """
-                        )
-                    except Exception as e:
-                        print(f"❌ Page.evaluate on search page crashed: {e}")
-                        items = []
-
+                    # Use the robust item extraction
+                    items = await _extract_items_from_search_page(search_page)
                     print(f"📦 Found {len(items)} items on page {page_num}")
 
-                    # Cap how many items we fully resolve per page
+                    if not items:
+                        print("❌ No items found on search page, checking page content...")
+                        # Debug: check what's actually on the page
+                        try:
+                            content = await search_page.content()
+                            if "s-item" in content:
+                                print("✅ s-item elements found in HTML")
+                            if "itm" in content:
+                                print("✅ /itm/ links found in HTML")
+                            if "No results found" in content:
+                                print("❌ Search returned no results")
+                        except Exception as e:
+                            print(f"⚠️ Could not check page content: {e}")
+
+                    # Process items
                     max_items_per_page = min(5, per_page - len(all_items))
                     for idx, item in enumerate(items[:max_items_per_page], start=1):
                         if len(all_items) >= per_page:
@@ -542,7 +660,7 @@ async def run(
                                 print("❌ Item page load failed after retries")
                                 continue
 
-                            await item_page.wait_for_timeout(500)
+                            await item_page.wait_for_timeout(1000)
 
                             price_gbp, sold_info = await _extract_item_price_debug(item_page)
                             condition, shipping, image = await _extract_additional_info(item_page)
@@ -583,7 +701,6 @@ async def run(
 
                         except Exception as e:
                             print(f"❌ Failed item ({item['title'][:80]}): {e}")
-                            print(traceback.format_exc())
                         finally:
                             await item_page.close()
 
