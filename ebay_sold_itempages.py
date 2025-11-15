@@ -96,31 +96,39 @@ def _build_search_url(query: str, page: int, mobile: bool) -> str:
 
 
 # =========================
-# Extraction helpers
+# Extraction helpers - UPDATED
 # =========================
 
 async def _extract_item_price_debug(page) -> Tuple[Optional[float], Optional[str]]:
-    """Extract price (GBP) and sold info from an item page, robustly."""
+    """Extract price (GBP) and sold info from an item page, with updated selectors."""
     print("🔍 Looking for price on item page...")
 
     price_gbp: Optional[float] = None
     sold_info: Optional[str] = None
 
-    # 1) Modern selectors
-    modern_selectors = [
-        '.x-price-primary span',
-        '[data-testid="x-price-primary"] span',
-        '.ux-textspans[aria-hidden="true"]',
-        '.ux-labels-values__values .ux-textspans',
+    # Updated selectors for current eBay layout
+    price_selectors = [
+        '.x-price-primary .ux-textspans',
+        '[data-testid="x-price-primary"] .ux-textspans',
         '.ux-textspans--BOLD',
-        '[data-testid="x-price-0"] .ux-textspans',
+        '.ux-labels-values__values .ux-textspans',
+        '.vi-price .ux-textspans',
+        '.mainPrice .ux-textspans',
+        # Try without the span child
+        '.x-price-primary',
+        '[data-testid="x-price-primary"]',
+        '.ux-labels-values__values',
+        '.ux-textspans',
+        '[class*="price"]',
     ]
-    for selector in modern_selectors:
+
+    for selector in price_selectors:
         try:
             locator = page.locator(selector)
             count = await locator.count()
             if count == 0:
                 continue
+                
             for i in range(min(count, 5)):
                 try:
                     text = await locator.nth(i).text_content()
@@ -129,89 +137,45 @@ async def _extract_item_price_debug(page) -> Tuple[Optional[float], Optional[str
                     cleaned = text.strip()
                     if not cleaned:
                         continue
+                    
+                    print(f"💰 Trying selector '{selector}': '{cleaned}'")
                     parsed = _parse_price_to_gbp(cleaned)
                     if parsed is not None:
                         price_gbp = parsed
-                        print(f"✅ Price via {selector}: {cleaned} -> £{price_gbp}")
+                        print(f"✅ Price found via {selector}: {cleaned} -> £{price_gbp}")
                         break
                 except Exception:
                     continue
+                    
             if price_gbp is not None:
                 break
         except Exception:
             continue
 
-    # 2) Legacy selectors
-    if price_gbp is None:
-        legacy_selectors = [
-            '#prcIsum',
-            '#mm-saleDscPrc',
-            '.vi-price .notranslate',
-            '.mainPrice',
-            '.display-price',
-            '.vi-price',
-            '.notranslate',
-            '#prcIsum_bidPrice',
-            '.vi-price-width',
-        ]
-        for selector in legacy_selectors:
-            try:
-                locator = page.locator(selector)
-                if await locator.count() > 0:
-                    text = await locator.first.text_content()
-                    if text:
-                        parsed = _parse_price_to_gbp(text.strip())
-                        if parsed is not None:
-                            price_gbp = parsed
-                            print(f"✅ Price via {selector}: £{price_gbp}")
-                            break
-            except Exception:
-                continue
-
-    # 3) HTML scan (cheap patterns only)
+    # Fallback: Try to extract from page content
     if price_gbp is None:
         try:
             content = await page.content()
+            # Look for common price patterns
             patterns = [
-                r'£\s*\d+[\d,]*\.?\d*',
-                r'\$\s*\d+[\d,]*\.?\d*',
+                r'data-price="([^"]*)"',
+                r'"amount":"([^"]*)"',
+                r'£\s*(\d+[\d,]*\.?\d*)',
+                r'US\s*\$\s*(\d+[\d,]*\.?\d*)',
             ]
             for pattern in patterns:
                 matches = re.findall(pattern, content)
                 for match in matches:
-                    parsed = _parse_price_to_gbp(match)
-                    if parsed is not None:
-                        price_gbp = parsed
-                        print(f"🔍 Price from HTML: {match} -> £{price_gbp}")
-                        break
+                    if match:
+                        parsed = _parse_price_to_gbp(str(match))
+                        if parsed is not None:
+                            price_gbp = parsed
+                            print(f"🔍 Price from HTML pattern: {match} -> £{price_gbp}")
+                            break
                 if price_gbp is not None:
                     break
         except Exception:
             pass
-
-    # Sold info selectors
-    sold_selectors = [
-        "span.ux-textspans:has-text('Ended') + span.ux-textspans",
-        "span.ux-textspans:has-text('Sold') + span.ux-textspans",
-        "div.ux-labels-values__labels:has(span:has-text('Ended')) + div .ux-textspans",
-        "div.ux-labels-values__labels:has(span:has-text('Sold')) + div .ux-textspans",
-        "[data-testid='x-sold-date'] .ux-textspans",
-        ".vi-tm-pos",
-        ".vi-price .vi-acc-del-range",
-        ".vi-bboxrev-pos",
-        ".vi-notify-new-bg-dBtm",
-    ]
-    for selector in sold_selectors:
-        try:
-            locator = page.locator(selector)
-            if await locator.count() > 0:
-                txt = await locator.first.text_content()
-                if txt:
-                    sold_info = txt.strip()
-                    print(f"📅 Sold info: {sold_info}")
-                    break
-        except Exception:
-            continue
 
     return price_gbp, sold_info
 
@@ -222,21 +186,27 @@ async def _extract_additional_info(page) -> Tuple[Optional[str], Optional[str], 
     shipping = None
     image = None
 
-    # Condition
+    # Condition - updated selectors
     for selector in [
-        '.x-item-condition-text .ux-textspans',
-        '[data-testid="x-item-condition-text"] .ux-textspans',
+        '.x-item-condition-text',
+        '[data-testid="x-item-condition-text"]',
+        '.ux-labels-values__values-content .ux-textspans',
         '#vi-itm-cond',
         '.vi-condition',
-        '[data-testid="x-item-condition"] .ux-textspans',
+        '[class*="condition"]',
+        '.ux-textspans',  # Broader selector
     ]:
         try:
             locator = page.locator(selector)
             if await locator.count() > 0:
                 txt = await locator.first.text_content()
                 if txt:
-                    condition = txt.strip()
-                    break
+                    condition_candidate = txt.strip()
+                    # Check if it's actually a condition (not other text)
+                    if any(keyword in condition_candidate.lower() for keyword in ['new', 'used', 'pre-owned', 'condition', 'excellent', 'good', 'fair']):
+                        condition = condition_candidate
+                        print(f"📦 Condition found: {condition}")
+                        break
         except Exception:
             pass
 
@@ -633,7 +603,7 @@ async def run(
                         except Exception as e:
                             print(f"⚠️ Could not check page content: {e}")
 
-                    # Process items - CHANGED: cap reduced from 10 to 3
+                    # Process items - cap reduced from 10 to 3
                     max_items_per_page = min(3, per_page - len(all_items))
                     for idx, item in enumerate(items[:max_items_per_page], start=1):
                         if len(all_items) >= per_page:
