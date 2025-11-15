@@ -9,6 +9,7 @@ from typing import List, Dict, Any, Optional, Tuple
 
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
+
 # =========================
 # Data Model
 # =========================
@@ -64,6 +65,7 @@ def _parse_price_to_gbp(price_text: str) -> Optional[float]:
         if m:
             try:
                 usd = float(m.group(1).replace(",", ""))
+                # rough USD->GBP fallback; final USD shown is via usd_rate on response
                 return round(usd * 0.78, 2)
             except ValueError:
                 pass
@@ -86,128 +88,139 @@ def _gbp_to_usd(gbp: Optional[float], usd_rate: float) -> Optional[float]:
 
 
 def _build_search_url(query: str, page: int, mobile: bool) -> str:
+    """
+    Build an eBay search URL:
+    - Sold + Completed
+    - Sort by recent
+    - 50 per page
+    - New items only (LH_ItemCondition=1000)
+    """
     q = urllib.parse.quote_plus(query)
     base = "https://www.ebay.co.uk"
     return (
         f"{base}/sch/i.html?_nkw={q}"
         f"&LH_Sold=1&LH_Complete=1&_sop=13&_ipg=50&_pgn={page}"
-        f"&LH_ItemCondition=1000"  # NEW condition only
+        f"&LH_ItemCondition=1000"
     )
 
 
 # =========================
-# Extraction helpers - FIXED PRICE EXTRACTION
+# Extraction helpers (item page)
 # =========================
 
 async def _extract_item_price_debug(page) -> Tuple[Optional[float], Optional[str]]:
-    """Extract price (GBP) and sold info from an item page - FIXED VERSION."""
+    """Extract price (GBP) and sold info from an item page, robustly."""
     print("🔍 Looking for price on item page...")
 
     price_gbp: Optional[float] = None
     sold_info: Optional[str] = None
 
-    # UPDATED PRICE SELECTORS FOR CURRENT EBAY
-    price_selectors = [
-        # Primary price selectors
+    # 1) Modern selectors
+    modern_selectors = [
         '.x-price-primary .ux-textspans',
         '[data-testid="x-price-primary"] .ux-textspans',
-        '.ux-textspans--BOLD',
+        '.ux-textspans[aria-hidden="true"]',
         '.ux-labels-values__values .ux-textspans',
-        
-        # Try direct text extraction from common price containers
-        '.mainPrice',
-        '.vi-price',
-        '.notranslation',
-        '.ux-textspans',
-        
-        # Broader selectors as fallback
-        '[class*="price"]',
-        '[data-testid*="price"]',
+        '.ux-textspans--BOLD',
+        '[data-testid="x-price-0"] .ux-textspans',
     ]
-
-    for selector in price_selectors:
+    for selector in modern_selectors:
         try:
             locator = page.locator(selector)
             count = await locator.count()
             if count == 0:
                 continue
-                
             for i in range(min(count, 5)):
                 try:
                     text = await locator.nth(i).text_content()
                     if not text:
                         continue
-                    cleaned = text.strip()
-                    if not cleaned:
-                        continue
-                    
-                    print(f"💰 Trying selector '{selector}': '{cleaned}'")
-                    parsed = _parse_price_to_gbp(cleaned)
+                    parsed = _parse_price_to_gbp(text.strip())
                     if parsed is not None:
                         price_gbp = parsed
-                        print(f"✅ Price found via {selector}: {cleaned} -> £{price_gbp}")
+                        print(f"✅ Price via {selector}: {text.strip()} -> £{price_gbp}")
                         break
                 except Exception:
                     continue
-                    
             if price_gbp is not None:
                 break
         except Exception:
             continue
 
-    # FALLBACK: Extract from search result price (often more reliable)
+    # 2) Legacy selectors
     if price_gbp is None:
-        try:
-            # Look for the sold price in the item details
-            sold_price_selectors = [
-                '.vi-price',
-                '.notranslation',
-                '.cc-ts-vi-price',
-                '#prcIsum',
-                '#mm-saleDscPrc',
-            ]
-            
-            for selector in sold_price_selectors:
-                try:
-                    locator = page.locator(selector)
-                    if await locator.count() > 0:
-                        text = await locator.first.text_content()
-                        if text:
-                            parsed = _parse_price_to_gbp(text.strip())
-                            if parsed is not None:
-                                price_gbp = parsed
-                                print(f"✅ Sold price found via {selector}: £{price_gbp}")
-                                break
-                except Exception:
-                    continue
-        except Exception:
-            pass
+        legacy_selectors = [
+            '#prcIsum',
+            '#mm-saleDscPrc',
+            '.vi-price .notranslate',
+            '.mainPrice',
+            '.display-price',
+            '.vi-price',
+            '.notranslate',
+            '#prcIsum_bidPrice',
+            '.vi-price-width',
+        ]
+        for selector in legacy_selectors:
+            try:
+                locator = page.locator(selector)
+                if await locator.count() > 0:
+                    text = await locator.first.text_content()
+                    if text:
+                        parsed = _parse_price_to_gbp(text.strip())
+                        if parsed is not None:
+                            price_gbp = parsed
+                            print(f"✅ Price via {selector}: £{price_gbp}")
+                            break
+            except Exception:
+                continue
 
-    # FINAL FALLBACK: Extract from page content using regex
+    # 3) Cheap HTML scan
     if price_gbp is None:
         try:
             content = await page.content()
-            # Look for common price patterns in the HTML
             patterns = [
-                r'"convertedPrice":\s*"([^"]*)"',
-                r'"binPrice":\s*"([^"]*)"',
-                r'data-price="([^"]*)"',
-                r'£\s*(\d+[\d,]*\.?\d*)',
-                r'US\s*\$\s*(\d+[\d,]*\.?\d*)',
+                r'£\s*\d+[\d,]*\.?\d*',
+                r'\$\s*\d+[\d,]*\.?\d*',
+                r'"amount":"(\d+[\d,]*\.?\d*)"',
+                r'data-price="(\d+[\d,]*\.?\d*)"'
             ]
             for pattern in patterns:
                 matches = re.findall(pattern, content)
                 for match in matches:
-                    if match:
-                        parsed = _parse_price_to_gbp(str(match))
-                        if parsed is not None:
-                            price_gbp = parsed
-                            print(f"🔍 Price from HTML pattern: {match} -> £{price_gbp}")
-                            break
+                    token = match if isinstance(match, str) else str(match)
+                    parsed = _parse_price_to_gbp(token)
+                    if parsed is not None:
+                        price_gbp = parsed
+                        print(f"🔍 Price from HTML: {token} -> £{price_gbp}")
+                        break
                 if price_gbp is not None:
                     break
         except Exception:
             pass
+
+    # Sold info (best-effort)
+    sold_selectors = [
+        "span.ux-textspans:has-text('Ended') + span.ux-textspans",
+        "span.ux-textspans:has-text('Sold') + span.ux-textspans",
+        "div.ux-labels-values__labels:has(span:has-text('Ended')) + div .ux-textspans",
+        "div.ux-labels-values__labels:has(span:has-text('Sold')) + div .ux-textspans",
+        "[data-testid='x-sold-date'] .ux-textspans",
+        ".vi-tm-pos",
+        ".vi-price .vi-acc-del-range",
+        ".vi-bboxrev-pos",
+        ".vi-notify-new-bg-dBtm",
+    ]
+    for selector in sold_selectors:
+        try:
+            locator = page.locator(selector)
+            if await locator.count() > 0:
+                txt = await locator.first.text_content()
+                if txt:
+                    sold_info = txt.strip()
+                    print(f"📅 Sold info: {sold_info}")
+                    break
+        except Exception:
+            continue
 
     return price_gbp, sold_info
 
@@ -218,27 +231,22 @@ async def _extract_additional_info(page) -> Tuple[Optional[str], Optional[str], 
     shipping = None
     image = None
 
-    # Condition - updated selectors
+    # Condition
     for selector in [
-        '.x-item-condition-text',
-        '[data-testid="x-item-condition-text"]',
+        '.x-item-condition-text .ux-textspans',
+        '[data-testid="x-item-condition-text"] .ux-textspans',
         '.ux-labels-values__values-content .ux-textspans',
         '#vi-itm-cond',
         '.vi-condition',
         '[class*="condition"]',
-        '.ux-textspans',  # Broader selector
     ]:
         try:
             locator = page.locator(selector)
             if await locator.count() > 0:
                 txt = await locator.first.text_content()
                 if txt:
-                    condition_candidate = txt.strip()
-                    # Check if it's actually a condition (not other text)
-                    if any(keyword in condition_candidate.lower() for keyword in ['new', 'used', 'pre-owned', 'condition', 'excellent', 'good', 'fair']):
-                        condition = condition_candidate
-                        print(f"📦 Condition found: {condition}")
-                        break
+                    condition = txt.strip()
+                    break
         except Exception:
             pass
 
@@ -326,7 +334,7 @@ async def _new_browser_context(pw, *, headless: bool):
         ignore_https_errors=True,
     )
 
-    # Correct route handler signature
+    # Correct route handler signature; block heavy assets, keep CSS
     async def block_assets(route):
         if route.request.resource_type in ("image", "media", "font"):
             await route.abort()
@@ -356,80 +364,103 @@ async def _safe_goto_page(page, url: str, *, max_retries: int = 2) -> bool:
 
 
 # =========================
-# Item extraction from search page - IMPROVED VERSION
+# Search-page extraction (robust)
 # =========================
 
 async def _extract_items_from_search_page(page) -> List[Dict[str, Any]]:
-    """Extract items from search page with better price extraction."""
-    items = []
-    
-    try:
-        items = await page.evaluate(
-            """
-            () => {
-                const items = [];
-                // Modern eBay layout - look for s-item elements
-                const listings = document.querySelectorAll('.s-item__wrapper, .s-item');
-                
-                for (const listing of listings) {
-                    try {
-                        const link = listing.querySelector('a.s-item__link');
-                        if (!link) continue;
-                        
-                        const href = link.getAttribute('href');
-                        if (!href || !href.includes('/itm/')) continue;
-                        
-                        const titleEl = listing.querySelector('.s-item__title');
-                        const title = titleEl ? titleEl.textContent.trim() : '';
-                        if (!title || title.includes('Shop on eBay')) continue;
-                        
-                        // IMPROVED: Better price extraction
-                        const priceEl = listing.querySelector('.s-item__price');
-                        let priceText = priceEl ? priceEl.textContent.trim() : '';
-                        
-                        // If no price found, try other price locations
-                        if (!priceText) {
-                            const soldPriceEl = listing.querySelector('.POSITIVE');
-                            priceText = soldPriceEl ? soldPriceEl.textContent.trim() : '';
-                        }
-                        
-                        const shippingEl = listing.querySelector('.s-item__shipping, .s-item__logisticsCost');
-                        const shippingText = shippingEl ? shippingEl.textContent.trim() : '';
-                        
-                        const imgEl = listing.querySelector('.s-item__image img');
-                        const image = imgEl ? (imgEl.getAttribute('src') || imgEl.getAttribute('data-src')) : null;
-                        
-                        // Also extract condition if available
-                        const conditionEl = listing.querySelector('.s-item__subtitle, .SECONDARY_INFO');
-                        const condition = conditionEl ? conditionEl.textContent.trim() : '';
-                        
-                        items.push({
-                            title: title,
-                            url: href,
-                            price_text: priceText,
-                            shipping_text: shippingText,
-                            image: image,
-                            condition: condition
-                        });
-                    } catch (e) {
-                        // Skip problematic items
-                        continue;
-                    }
-                }
-                return items;
-            }
-            """
-        )
-        print(f"📦 Found {len(items)} items on search page")
-        
-        # Debug: show what we found
-        for i, item in enumerate(items[:3]):
-            print(f"  {i+1}. {item['title'][:60]}... | Price: '{item.get('price_text', 'N/A')}'")
-            
-    except Exception as e:
-        print(f"❌ Item extraction failed: {e}")
-        items = []
+    """Extract items from search page using multiple layouts with safe fallbacks."""
+    items: List[Dict[str, Any]] = []
 
+    # Path A: canonical ".s-item" cards
+    try:
+        cards = await page.query_selector_all('.s-item, .s-item__wrapper')
+        if cards and len(cards) > 0:
+            html_items = await page.evaluate(
+                """
+                () => {
+                    const out = [];
+                    const cards = document.querySelectorAll('.s-item, .s-item__wrapper');
+                    for (const card of cards) {
+                        try {
+                            const link = card.querySelector('a.s-item__link, a[href*="/itm/"]');
+                            if (!link) continue;
+                            const href = link.getAttribute('href') || '';
+                            if (!href || !href.includes('/itm/')) continue;
+
+                            const titleEl = card.querySelector('.s-item__title, h3.s-item__title, [role="heading"]');
+                            const rawTitle = (titleEl?.textContent || link.textContent || '').trim();
+                            const title = rawTitle.replace(/Opens in a new window or tab/i, '').trim();
+                            if (!title || title.toLowerCase().includes('shop on ebay')) continue;
+
+                            const imgEl = card.querySelector('.s-item__image img, img');
+                            const image = imgEl ? (imgEl.getAttribute('src') || imgEl.getAttribute('data-src')) : null;
+
+                            const priceEl = card.querySelector('.s-item__price, .POSITIVE');
+                            const price_text = (priceEl?.textContent || '').trim();
+
+                            const shipEl = card.querySelector('.s-item__shipping, .s-item__logisticsCost');
+                            const shipping_text = (shipEl?.textContent || '').trim();
+
+                            const condEl = card.querySelector('.s-item__subtitle, .SECONDARY_INFO');
+                            const condition = (condEl?.textContent || '').trim();
+
+                            out.push({ title, url: href, image, price_text, shipping_text, condition });
+                        } catch (e) {}
+                    }
+                    return out;
+                }
+                """
+            )
+            items.extend(html_items)
+    except Exception as e:
+        print(f"⚠️ Search extract (Path A) failed: {e}")
+
+    # Path B: anchor scan fallback
+    if not items:
+        try:
+            html_items = await page.evaluate(
+                """
+                () => {
+                    const out = [];
+                    const seen = new Set();
+                    const anchors = document.querySelectorAll('a[href*="/itm/"]');
+                    for (const a of anchors) {
+                        try {
+                            const href = a.getAttribute('href') || '';
+                            if (!href || !href.includes('/itm/') || seen.has(href)) continue;
+
+                            const card = a.closest('.s-item, .s-item__wrapper, li') || a.parentElement;
+
+                            const titleEl = card?.querySelector('.s-item__title, h3.s-item__title, [role="heading"]');
+                            const rawTitle = (titleEl?.textContent || a.textContent || '').trim();
+                            const title = rawTitle.replace(/Opens in a new window or tab/i, '').trim();
+                            if (!title || title.toLowerCase().includes('shop on ebay')) continue;
+
+                            const imgEl = card?.querySelector('img');
+                            const image = imgEl ? (imgEl.getAttribute('src') || imgEl.getAttribute('data-src')) : null;
+
+                            const priceEl = card?.querySelector('.s-item__price, .POSITIVE');
+                            const price_text = (priceEl?.textContent || '').trim();
+
+                            const shipEl = card?.querySelector('.s-item__shipping, .s-item__logisticsCost');
+                            const shipping_text = (shipEl?.textContent || '').trim();
+
+                            const condEl = card?.querySelector('.s-item__subtitle, .SECONDARY_INFO');
+                            const condition = (condEl?.textContent || '').trim();
+
+                            out.push({ title, url: href, image, price_text, shipping_text, condition });
+                            seen.add(href);
+                        } catch (e) {}
+                    }
+                    return out;
+                }
+                """
+            )
+            items.extend(html_items)
+        except Exception as e:
+            print(f"⚠️ Search extract (Path B) failed: {e}")
+
+    print(f"📦 Found {len(items)} items on search page")
     return items
 
 
@@ -493,7 +524,7 @@ async def run_with_retries(
 
 
 # =========================
-# Single run - FIXED PRICE EXTRACTION
+# Single run
 # =========================
 
 async def run(
@@ -506,7 +537,10 @@ async def run(
     mobile: bool = False,
     smoke: bool = False,
 ) -> Dict[str, Any]:
-    """Single-attempt scrape with improved price extraction."""
+    """Single-attempt scrape with robust search extraction and low memory use.
+       Enforces NEW items only via LH_ItemCondition=1000 on search URL, and
+       applies a soft on-page condition check: if we *see* a non-new condition, skip;
+       if we can't read it, we keep the item (trusts the search filter)."""
     start_time = time.time()
     all_items: List[Dict[str, Any]] = []
     seen_urls = set()
@@ -537,26 +571,37 @@ async def run(
                     search_url = _build_search_url(query, page_num, mobile=False)
                     print(f"🔍 Searching: {search_url}")
 
-                    await asyncio.sleep(random.uniform(0.5, 1.0))
+                    await asyncio.sleep(random.uniform(0.4, 0.9))
                     if not await _safe_goto_page(search_page, search_url):
                         print(f"❌ Failed to load search page {page_num}")
                         continue
 
                     print("✅ Search page loaded successfully")
 
-                    # Wait a bit for content to render
-                    await search_page.wait_for_timeout(2000)
+                    # Wait for any of the common result selectors, but don't hard fail
+                    try:
+                        await search_page.wait_for_selector(
+                            ".s-item, .s-item__wrapper, a[href*='/itm/']",
+                            timeout=4000
+                        )
+                    except PWTimeout:
+                        print("⚠️ Results selector wait timed out, continuing with evaluate()")
 
-                    # Use the improved item extraction
+                    # Minimal scroll to trigger lazy content (guarded)
+                    try:
+                        await search_page.mouse.wheel(0, 500)
+                        await search_page.wait_for_timeout(150)
+                    except Exception as e:
+                        print(f"⚠️ Scroll skipped: {e}")
+
+                    # Extract candidates
                     items = await _extract_items_from_search_page(search_page)
-                    print(f"📦 Found {len(items)} items on page {page_num}")
-
                     if not items:
                         print("❌ No items found on search page")
                         continue
 
-                    # Process items
-                    max_items_per_page = min(3, per_page - len(all_items))
+                    # Cap how many items we resolve per page (Railway memory)
+                    max_items_per_page = min(5, per_page - len(all_items))
                     for idx, item in enumerate(items[:max_items_per_page], start=1):
                         if len(all_items) >= per_page:
                             break
@@ -576,29 +621,30 @@ async def run(
 
                         item_page = await context.new_page()
                         try:
-                            await asyncio.sleep(random.uniform(0.7, 1.3))
+                            await asyncio.sleep(random.uniform(0.6, 1.2))
 
                             ok = await _safe_goto_page(item_page, raw_url)
                             if not ok:
                                 print("❌ Item page load failed after retries")
                                 continue
 
-                            await item_page.wait_for_timeout(1000)
+                            await item_page.wait_for_timeout(500)
 
-                            # Use the FIXED price extraction
                             price_gbp, sold_info = await _extract_item_price_debug(item_page)
                             condition, shipping, image = await _extract_additional_info(item_page)
 
-                            # FILTER: Only keep NEW condition items
-                            if condition and not any(keyword in condition.lower() for keyword in ['new', 'new with box', 'new without box', 'new with tags']):
-                                print(f"⏩ Skipping non-new item (condition: {condition})")
+                            # NEW-ONLY SOFT CHECK:
+                            # - If we can read condition and it clearly doesn't contain "new", skip.
+                            # - If condition is missing/unclear, keep (search filter already enforces New).
+                            if condition and ("new" not in condition.lower()):
+                                print(f"⏩ Skipping non-new item (condition seen: {condition})")
                                 continue
 
                             search_price_text = item.get("price_text") or ""
                             search_shipping_text = item.get("shipping_text") or ""
                             search_condition = item.get("condition") or ""
 
-                            # PRIORITIZE: Use search result price if item page price extraction failed
+                            # Fallback to search card price
                             if price_gbp is None and search_price_text:
                                 parsed = _parse_price_to_gbp(search_price_text)
                                 if parsed is not None:
@@ -614,23 +660,9 @@ async def run(
                             if not image and item.get("image"):
                                 image = item["image"]
 
-                            # If still no price, try to extract from title
-                            if price_gbp is None:
-                                title_price_match = re.search(r'£\s*(\d+[\d,]*\.?\d*)', item["title"])
-                                if title_price_match:
-                                    try:
-                                        price_gbp = float(title_price_match.group(1).replace(",", ""))
-                                        print(f"🔍 Price extracted from title: £{price_gbp}")
-                                    except ValueError:
-                                        pass
-
                             sold_item = SoldItem(
-                                title=item["title"].replace("Opens in a new window or tab", "").strip(),
-                                price_text=(
-                                    f"£{price_gbp:.2f}"
-                                    if price_gbp is not None
-                                    else search_price_text or "N/A"
-                                ),
+                                title=item["title"],
+                                price_text=(f"£{price_gbp:.2f}" if price_gbp is not None else search_price_text or "N/A"),
                                 price_gbp=price_gbp,
                                 price_usd=_gbp_to_usd(price_gbp, usd_rate),
                                 shipping_text=shipping,
@@ -641,10 +673,11 @@ async def run(
                             )
 
                             all_items.append(asdict(sold_item))
-                            print(f"✅ Collected NEW item: {sold_item.title[:80]} | {sold_item.price_text} | {sold_item.condition}")
+                            print(f"✅ Collected NEW item: {sold_item.title[:80]} | {sold_item.price_text}")
 
                         except Exception as e:
                             print(f"❌ Failed item ({item['title'][:80]}): {e}")
+                            print(traceback.format_exc())
                         finally:
                             await item_page.close()
 
