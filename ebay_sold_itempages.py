@@ -633,8 +633,8 @@ async def run(
                         except Exception as e:
                             print(f"⚠️ Could not check page content: {e}")
 
-                    # Process items - cap increased from 5 to 10
-                    max_items_per_page = min(10, per_page - len(all_items))
+                    # Process items - CHANGED: cap reduced from 10 to 3
+                    max_items_per_page = min(3, per_page - len(all_items))
                     for idx, item in enumerate(items[:max_items_per_page], start=1):
                         if len(all_items) >= per_page:
                             break
